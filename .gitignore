@@ -1,2 +1,7 @@
 .venv/
 .uv-cache/
+# 模型二进制（官方发布，按 docs/handover.md 的 URL+md5 重新下载）
+models/*.onnx
+# 浏览器 E2E 产生的临时 profile 与证据
+.e2e-profile*/
+tests/evidence/
