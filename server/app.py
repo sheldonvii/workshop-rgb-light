@@ -27,6 +27,7 @@ import threading
 import time
 import traceback
 from emotion_models import EmotionModel, REGISTRY, LABELS
+from lighting import Lighting, load_config
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -265,6 +266,7 @@ class ModelBundle:
 
 
 MODELS = ModelBundle()
+LIGHT = None
 
 MIME = {
     ".html": "text/html; charset=utf-8",
@@ -319,6 +321,9 @@ class Handler(BaseHTTPRequestHandler):
         if path_only == "/api/health":
             self._send_json(200 if MODELS.state == "ready" else 503, MODELS.health())
             return
+        if path_only == '/api/light':
+            self._send_json(200, {'ok': True, 'light': LIGHT.snapshot()})
+            return
         # 静态资源：只允许 web/ 目录内
         rel = path_only.lstrip("/")
         target = (WEB_DIR / rel).resolve()
@@ -328,12 +333,27 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": {"code": "not_found", "message": "资源不存在"}})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == '/api/light/session':
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+                if not 0 < n <= 512:
+                    raise ValueError('会话参数过长或为空')
+                data = json.loads(self.rfile.read(n))
+                accepted = LIGHT.session(data['action'], data['run_id'])
+                self._send_json(200 if accepted else 409, {'ok': accepted, 'light': LIGHT.snapshot(),
+                    **({} if accepted else {'error': {'code': 'light_busy', 'message': '另一页面正在体验，请先在该页面停止'}})})
+            except (ValueError, KeyError, TypeError) as exc:
+                self._send_json(400, {'ok': False, 'error': {'code': 'bad_request', 'message': str(exc)}})
+            return
         if self.path == '/api/model':
             try:
                 n = int(self.headers.get('Content-Length', '0'))
                 if not 0 < n <= 256:
                     raise ValueError('bad request')
                 key = json.loads(self.rfile.read(n))['model']
+                if LIGHT.snapshot()['owner']:
+                    self._send_json(409, {'ok': False, 'error': {'code': 'light_busy', 'message': '请先停止正在进行的体验'}})
+                    return
                 status, payload = MODELS.switch(key)
                 self._send_json(status, payload)
             except (ValueError, KeyError, TypeError):
@@ -349,8 +369,15 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0 or length > MAX_UPLOAD:
             self._send_json(400, {"ok": False, "error": {"code": "bad_image", "message": "请求体为空或超过 8MB"}})
             return
+        run_id = self.headers.get('X-Run-Id', '')
+        try:
+            seq = int(self.headers.get('X-Seq', '0'))
+        except ValueError:
+            seq = 0
+        ticket = LIGHT.ticket(run_id, seq)
         jpeg = self.rfile.read(length)
         status, payload = MODELS.infer_locked(jpeg)
+        payload['light'] = LIGHT.accept(ticket, payload) if status == 200 else LIGHT.snapshot()
         # 运行标识与帧序号原样回显，页面端据此丢弃过期/跨运行结果
         payload["run_id"] = self.headers.get("X-Run-Id", "")
         try:
@@ -362,16 +389,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global LIGHT
     os.chdir(ROOT)  # Vision YAML paths are relative to the project root.
     ap = argparse.ArgumentParser(description="情绪晴雨表 Demo 服务")
     ap.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1，本机使用）")
     ap.add_argument("--port", type=int, default=8321, help="监听端口（默认 8321）")
     ap.add_argument('--emotion-model', choices=['hse-b0', 'hse-b2', 'official'], default='hse-b0')
+    ap.add_argument('--light-config', default=str(ROOT / 'configs/light.json'))
     args = ap.parse_args()
     MODELS.emotion_key = args.emotion_model
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    LIGHT = Lighting(load_config(args.light_config))
+    LIGHT.start()
     def terminate(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, terminate)
@@ -383,6 +414,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        LIGHT.close()
         httpd.server_close()
         MODELS.release()
         log.info("stopped, models released")

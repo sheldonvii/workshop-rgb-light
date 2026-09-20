@@ -32,7 +32,9 @@ async function main(){
  await ev("$('btnMain').click()");
  check('stop resets output',await ev("!LAMP.current&&document.body.dataset.mood==='none'&&S.phase==='idle'"));
  // Explicit synthetic UI fixtures for color/transition/accessibility, not accuracy.
- await ev(`S.phase='running';S.lastCount=1;S.stale=false;LAMP.current={label:'happy',label_zh:'开心',score:.8,score_type:'softmax'};LAMP.status='stable';renderCurrent();`);
+ // Freeze backend polling only for explicitly synthetic visual fixtures.
+ await ev("window.qaFetch=window.fetch;window.fetch=(url,opts)=>url==='/api/light'?new Promise(()=>{}):qaFetch(url,opts);lightSessionQueue");await sleep(350);
+ await ev(`S.phase='running';S.lastCount=1;S.stale=false;LAMP.snapshot=null;LAMP.current={label:'happy',label_zh:'开心',score:.8,score_type:'softmax'};LAMP.status='stable';renderCurrent();`);
  await sleep(550);await shot('happy-ui-fixture-dark');
  check('warm background',await ev("getComputedStyle(document.body).backgroundColor==='rgb(73, 59, 29)'"));
  await ev("$('themeToggle').click()");await sleep(550);await shot('happy-ui-fixture-light');

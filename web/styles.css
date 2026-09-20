@@ -23,7 +23,7 @@ body[data-mood=disgust]{--scene-bg:#303c24}body[data-mood=contempt]{--scene-bg:#
 :root[data-theme=light] body[data-mood=fear]{--scene-bg:#ddd2ed}
 :root[data-theme=light] body[data-mood=disgust]{--scene-bg:#dde8c6}
 :root[data-theme=light] body[data-mood=contempt]{--scene-bg:#ebd0e2}
-@media(prefers-reduced-motion:no-preference){body{transition:background-color .45s ease}}
+@media(prefers-reduced-motion:no-preference){body{transition:background-color .4s ease}}
 body.drawer-open{overflow:hidden}
 .settings-drawer{position:fixed;inset:0 0 0 auto;margin:0;width:min(440px,100%);height:100dvh;max-width:100%;max-height:100dvh;padding:0;border:0;border-left:1px solid var(--line);background:var(--surface);color:var(--text);box-shadow:-20px 0 60px #100b2330;overflow-y:auto;overscroll-behavior:contain}
 .settings-drawer::backdrop{background:#100b235c}
@@ -55,6 +55,8 @@ body:not([data-mood=none]) .camera-controls .btn:active{
 }
 @media(prefers-reduced-motion:no-preference){
   .studio-sticker,.photo-tab,.camera-controls .btn{
-    transition:background-color .45s ease,color .45s ease,border-color .45s ease,box-shadow .45s ease,transform .18s ease;
+    transition:background-color .4s ease,color .4s ease,border-color .4s ease,box-shadow .4s ease,transform .18s ease;
   }
 }
+
+.light-connection{margin:12px 0 0;color:var(--muted);font-size:12px}.light-connection::before{content:"";display:inline-block;width:6px;height:6px;margin-right:8px;border-radius:50%;background:currentColor}.light-connection[data-status=connected]::before{background:#8adac6}.light-connection[data-status=disconnected],.light-connection[data-status=unavailable]{color:var(--danger)}

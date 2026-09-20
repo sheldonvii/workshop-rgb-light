@@ -1,7 +1,7 @@
 "use strict";
 const LABEL_ZH = {happy:'开心',neutral:'平静',surprise:'惊讶',sad:'难过',angry:'生气',fear:'害怕',disgust:'厌恶',contempt:'轻蔑'};
 const WEATHER_ICON = {happy:'sun',neutral:'moon',surprise:'sparkles',sad:'cloud-rain',angry:'flame',fear:'cloud-fog',disgust:'leaf',contempt:'cloud'};
-const LIGHT_NAME = {happy:'日光黄',neutral:'薄荷青',surprise:'蜜桃橙',sad:'雨夜蓝',angry:'珊瑚红',fear:'雾紫',disgust:'青柠绿',contempt:'玫瑰粉'};
+const LIGHT_NAME = {happy:'日光黄',neutral:'薄荷青',surprise:'琥珀橙',sad:'雨夜蓝',angry:'朱红',fear:'紫罗兰',disgust:'青柠绿',contempt:'玫瑰粉'};
 let activeLabels = Object.keys(LABEL_ZH);
 let currentModel = 'hse-b0';
 let changingModel = false;
@@ -40,10 +40,10 @@ function createDistribution() {
 }
 function updateWeather() {
   const raw=S.phase==='running'&&!S.stale?S.lastPrimary:null;
-  const p=S.phase==='running'&&!S.stale?LAMP.current:null;
+  const p=LAMP.current;
   const valid=!!p;
   $('clearHistory').disabled=!S.timeline.length;
-  $('modelSelect').disabled=S.phase!=='idle'||changingModel;
+  $('modelSelect').disabled=S.phase!=='idle'||changingModel||!!LAMP.snapshot?.owner;
   $('distributionNote').textContent=raw?.distribution ? '原始分数' : raw ? '此模型只返回首选类别' : S.stale ? '结果已失效' : '等待识别';
   for(const row of $('distribution').children){
     const v=raw?.distribution?.find(x=>x.label===row.dataset.label);
@@ -53,30 +53,40 @@ function updateWeather() {
   }
   $('rawResult').textContent=raw ? `${raw.uncertain?'不确定，较接近':'首选类别'}${raw.label_zh}${raw.score_type==='softmax'?` · ${(raw.score*100).toFixed(1)}%`:''}` : S.stale?'结果已失效':'等待单人入镜';
   const name=valid?WEATHER_ICON[p.label]:S.phase==='idle'?'power':'scan-face';
-  document.body.dataset.light=valid?'on':S.phase==='idle'?'standby':'off';
+  document.body.dataset.light=valid?'on':'standby';
   document.body.dataset.mood=p?.label||'none';
-  setLightTarget(valid?MOOD_COLOR[p.label]:S.phase==='idle'?'#eab7cf':'#a495af',valid?1:S.phase==='idle'?.55:0);
-  $('lightName').textContent=valid?LIGHT_NAME[p.label]:S.phase==='idle'?'待机光':'灯色待定';
-  $('lightState').textContent=valid?(LAMP.status==='stable'?'确认后点亮 · 缓慢换色':'保留上一灯色 · 继续观察'):S.phase==='idle'?'屏幕灯效 · 等你入镜':S.stale?'结果失效 · 情绪灯已熄灭':raw?.uncertain?'判断不确定 · 暂不点亮':'等待单人表情 · 暂不点亮';
+  setLightTarget(valid?MOOD_COLOR[p.label]:'#eab7cf',valid?1:.24);
+  $('lightName').textContent=valid?LIGHT_NAME[p.label]:'待机光';
+  $('lightState').textContent=valid?(LAMP.status==='stable'?'情绪已确认 · 柔和换色':'保留上一灯色 · 继续观察'):S.stale?'结果暂未更新 · 已回到待机光':raw?.uncertain?'判断不确定 · 保持待机光':S.lastCount>1?'多人入镜 · 保持待机光':'待机光 · 等待稳定表情';
+  const device=LAMP.snapshot?.device;
+  $('lightConnection').dataset.status=device?.status||'connecting';
+  $('lightConnection').textContent=device?.status==='connected'?`控制器已连接 · 配置 ${device.led_count} 颗灯珠`:device?.status==='disabled'?'屏幕预览 · 实体灯带未启用':device?.status==='disconnected'?'控制器未连接 · 正在重试':device?.status==='unavailable'?'灯光服务暂不可达':'正在连接控制器…';
+  $('lightDeviceDetail').textContent=device?.message|| (device?.status==='connected'?`WLED ${device.version} · USB 在线；灯带接线和供电需现场确认`:'检查 USB 连接和 README 中的串口权限说明。');
   for(const chip of $('colorLegend').children)chip.classList.toggle('active',!!valid&&chip.dataset.label===p.label);
   const symbol=$('weatherSymbol');
   if(symbol.dataset.icon!==name){symbol.dataset.icon=name;symbol.innerHTML=`<i data-lucide="${name}"></i>`;window.lucide?.createIcons();}
   drawWeather();
 }
-// Repaint only during the 450 ms transition; no permanent animation loop.
+// Interpolate the backend trajectory locally; polling never creates a new target.
 const reducedLight=matchMedia('(prefers-reduced-motion: reduce)');
 const lightPaint={hex:'#eab7cf',power:.55,target:'',raf:0,last:0};
 function setLightTarget(hex,power){
-  const target=hex+':'+power;if(lightPaint.target===target)return;lightPaint.target=target;
+  const state=LAMP.snapshot;
+  const track=state?.device.status!=='unavailable'?state?.transition:null;
+  const target=track?`${state.instance}:${state.sample_ms}`:hex+':'+power;
+  if(lightPaint.target===target)return;lightPaint.target=target;
   document.body.style.setProperty('--mood-accent',hex);
   cancelAnimationFrame(lightPaint.raf);
   const from=lightPaint.hex,fromPower=lightPaint.power,start=performance.now();
   const channels=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16));
-  const a=channels(from),b=channels(hex),duration=reducedLight.matches?0:450;
+  const a=track?track.from:channels(from),b=track?track.to:channels(hex);
+  const duration=reducedLight.matches?0:track?.duration_ms||400;
+  const elapsed=track?.elapsed_ms||0;
+  const startPower=track?track.from_power*4:fromPower,endPower=track?track.to_power*4:power;
   function frame(now){
-    const t=duration?Math.min(1,(now-start)/duration):1,e=t*t*(3-2*t);
+    const t=duration?Math.min(1,(elapsed+now-start)/duration):1,e=t*t*(3-2*t);
     lightPaint.hex='#'+a.map((v,i)=>Math.round(v+(b[i]-v)*e).toString(16).padStart(2,'0')).join('');
-    lightPaint.power=fromPower+(power-fromPower)*e;
+    lightPaint.power=Math.min(1,startPower+(endPower-startPower)*e);
     document.body.style.setProperty('--mood',lightPaint.hex);drawWeather();
     if(t<1)lightPaint.raf=requestAnimationFrame(frame);else lightPaint.raf=0;
   }
@@ -89,9 +99,9 @@ function drawWeather() {
   const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);
   const w=box.width,h=box.height;
   const raw=S.phase==='running'&&!S.stale?S.lastPrimary:null;
-  const p=S.phase==='running'&&!S.stale?LAMP.current:null;
+  const p=LAMP.current;
   const valid=!!p;
-  const standby=S.phase==='idle',lit=lightPaint.power>.01;
+  const standby=!valid,lit=lightPaint.power>.01;
   const hue=lightPaint.hex;
   const dark=document.documentElement.dataset.theme!=='light';
   const path=new Path2D();
@@ -101,9 +111,9 @@ function drawWeather() {
   path.bezierCurveTo(w*.89,h*.71,w*.54,h*.77,w*.34,h*.83);
   path.bezierCurveTo(w*.14,h*.91,w*.44,h*1.02,w*.67,h*.91);
   const color=ctx.createLinearGradient(w*.08,h*.8,w*.91,h*.15);
-  color.addColorStop(0,standby?'#c8a9f0':hue);
-  color.addColorStop(.48,standby?'#f6b2b2':hue);
-  color.addColorStop(1,standby?'#f5d995':hue);
+  color.addColorStop(0,hue);
+  color.addColorStop(.48,hue);
+  color.addColorStop(1,hue);
   const spread=ctx.createRadialGradient(w*.54,h*.54,0,w*.54,h*.54,w*.43);
   spread.addColorStop(0,hue+(lit?(dark?'22':'10'):'00'));spread.addColorStop(1,hue+'00');
   ctx.fillStyle=spread;ctx.fillRect(0,0,w,h);
@@ -128,6 +138,7 @@ $('modelSelect').addEventListener('change',async e=>{
   const key=e.target.value;changingModel=true;e.target.disabled=true;$('btnMain').disabled=true;
   $('modelStatus').textContent='正在加载并检查模型…';
   try{
+    await lightSessionQueue;
     const r=await fetch('/api/model',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:key}),signal:AbortSignal.timeout(30000)});
     const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error?.message||'模型切换失败');
     S.timeline=[];S.historyGap=true;renderTimeline(false);await applyModelInfo(j);$('modelStatus').textContent='模型已就绪，可以开始体验。';

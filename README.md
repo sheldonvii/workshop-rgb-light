@@ -1,8 +1,23 @@
 # 情绪晴雨表
 
-在 SpacemiT K3 上用 USB 摄像头识别人脸表情，让网页灯带、背景和控件同步变色。画面在本机处理。当前提供屏幕灯效，尚未接入实体灯带。
+在 SpacemiT K3 上用 USB 摄像头识别人脸表情，让网页灯带、背景和控件同步变色。画面在本机处理。通过 USB Adalight 二进制协议控制 WLED 实体灯带，网页同步显示后端灯光状态；控制器不需要连接 Wi-Fi。
 
 默认使用 HSEmotion B0 八分类，设置中可以切换 B2 或官方七分类模型。多人入镜时暂停表情分类。识别结果描述可见表情，不代表真实心理状态。
+
+## 准备控制器
+
+已验证 WLED-Controller-S2（WLED 0.15.1）与 30 颗 RGB 灯珠。用 USB 数据线将控制器连接 K3，先在 WLED 中确认灯带类型、GPIO、颜色顺序和灯珠数量。控制过程无需连接 Wi-Fi，供电需与灯带匹配。
+
+首次部署时，在 K3 终端为实际运行用户配置串口权限：
+
+```bash
+ls -l /dev/serial/by-id/
+sudo usermod -aG dialout bianbu  # 如使用其他账户，替换为实际用户名
+```
+
+退出并重新登录，执行 `id` 确认包含 `dialout`；日常运行无需 sudo。修改 [configs/light.json](configs/light.json) 的 `port` 和 `led_count`，与实际设备一致。仅体验网页时，可将 `enabled` 设为 `false`。
+
+接线、WLED 设置、完整参数、迁移与排障见 [控制器说明](docs/controller.md)。
 
 ## 安装与运行
 
@@ -22,30 +37,25 @@ export UV_CACHE_DIR="$PWD/.uv-cache"
 
 权重不进入 Git。下载脚本维护四个在用模型的来源和 SHA-256；已有文件校验不符时会报错，不覆盖。已有环境可直接运行 `./run.sh`。
 
-## 验证
+## 快速检查
 
-服务启动并使用 B0 后，关闭其他体验页面，依次运行：
+开始体验后，确认相机有画面、单人表情能更新，页面显示控制器已连接。停止体验后，灯带应渐变回待机光。也可在服务运行时执行：
 
 ```bash
 .venv/bin/python scripts/smoke_vision.py
-.venv/bin/python tests/test_api.py
-node tests/test_light_controller.js
-node tests/test_ui.js
-node tests/test_browser_contract.js
-node tests/test_browser_contract.js --lifecycle
-node tests/test_camera.js
 ```
 
-浏览器测试使用 Node.js 22+ 内置 WebSocket 和系统 Chromium，无 npm 依赖。测试自动生成的报告放在 `tests/output/`，不进入 Git。真实服务重启测试与持续测试见开发说明，不与上面的测试并行运行。
+完整接口、灯光、浏览器和摄像头测试见 [开发验证](docs/development.md#测试与复现)。
 
 ## 目录
 
 | 路径 | 用途 |
 | --- | --- |
 | `server/`、`configs/` | HTTP 服务、推理和模型配置 |
-| `web/` | 页面、灯效和共用测试帧 |
+| `web/` | 页面、后端灯光状态显示和共用测试帧 |
 | `scripts/` | 模型下载校验、运行中服务冒烟 |
-| `tests/` | 六个测试入口及共用浏览器工具 |
+| `tests/` | 后端灯光、接口与浏览器测试 |
+| `docs/controller.md` | 控制器接线、权限、参数与排障 |
 | `docs/development.md` | 当前行为、API、环境约束与开发验证 |
 | `licenses/` | 第三方许可和来源 |
 

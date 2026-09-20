@@ -43,7 +43,14 @@ async function openBrowser({camera=false}={}) {
   process.once('exit',terminate);
   async function close() {
     for (const {timer,reject} of pending.values()) {clearTimeout(timer);reject(Error('Browser closed'));}
-    pending.clear();ws?.close();
+    pending.clear();
+    // Ask Chromium to flush and close its helpers before removing the profile.
+    if(ws?.readyState===WebSocket.OPEN && browser.exitCode===null && browser.signalCode===null){
+      const exited=new Promise(resolve=>browser.once('exit',resolve));
+      ws.send(JSON.stringify({id:++id,method:'Browser.close'}));
+      await Promise.race([exited,sleep(2000)]);
+    }
+    ws?.close();
     if (browser.exitCode===null && browser.signalCode===null && browser.pid) {
       const exited=new Promise(resolve=>browser.once('exit',resolve));
       browser.kill('SIGTERM');
@@ -51,7 +58,8 @@ async function openBrowser({camera=false}={}) {
       if(browser.exitCode===null && browser.signalCode===null){browser.kill('SIGKILL');await exited;}
     }
     process.removeListener('exit',terminate);
-    fs.rmSync(profile,{recursive:true,force:true,maxRetries:3,retryDelay:100});
+    // Chromium helpers may finish profile writes after the parent exits.
+    fs.rmSync(profile,{recursive:true,force:true,maxRetries:10,retryDelay:200});
   }
   try {
     const started=Date.now();let version;

@@ -17,9 +17,9 @@ const CFG = {
 };
 
 const MOOD_COLOR = {
-  happy: "#F4CE76", surprise: "#F7AD8A", neutral: "#8ADAC6",
-  sad: "#8AB2ED", angry: "#ED8F92", fear: "#B7A2E4", disgust: "#C0D98B",
-  contempt: "#E7AACF",
+  happy: "#FFD000", surprise: "#FF780A", neutral: "#00D9A6",
+  sad: "#246BFF", angry: "#FF2010", fear: "#8000FF", disgust: "#55DD00",
+  contempt: "#FF269C",
 };
 
 /* 隔离的测试帧源模式（仅 ?frames=test 显式开启；正式入口默认摄像头，不受影响）。
@@ -205,7 +205,8 @@ async function start() {
     }
     if (generation !== S.generation) return;
     S.trackInfo = { w: 1280, h: 720, fps: 0, label: "测试帧源（官方测试图）" };
-    beginRunning();
+    await beginRunning();
+    if(S.phase!=='running')return;
     setBanner("warn", "testsrc",
       "测试帧源模式：画面与结果来自官方测试图的真实推理，非摄像头采集。关闭地址里的 ?frames=test 即回到正式入口。");
     return;
@@ -259,13 +260,22 @@ async function start() {
   try { await els.video.play(); } catch { if (generation !== S.generation) return; stop(); setBanner('danger','cam','视频预览无法启动，请重试。'); return; }
   if (generation !== S.generation) { stream.getTracks().forEach(t => t.stop()); return; }
   track.addEventListener("ended", onTrackEnded);
-  beginRunning();
+  await beginRunning();
 }
 
-function beginRunning() {
+async function beginRunning() {
+  const generation=S.generation;
+  const runId=(crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+  S.runId=runId;
+  try {
+    const light=await lightSession('start',runId);
+    if(generation!==S.generation){void lightSession('stop',runId).catch(()=>{});return;}
+    LAMP.apply(light);
+  } catch(err) {
+    if(generation!==S.generation)return;
+    stop();setBanner('warn','light-owner',err.message);return;
+  }
   S.phase = "running";
-  S.runId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
-  LAMP.reset();
   S.seq = 0; S.lastAcceptedSeq = 0;
   S.lastOkTs = 0; S.failCount = 0; S.stale = false;
   S.accepted = [];
@@ -296,19 +306,20 @@ function currentTestFrame(now) {
   if (!testFrames.lastSwitch || now - testFrames.lastSwitch >= TEST_FRAME_MS) {
     if (testFrames.lastSwitch) testFrames.idx = (testFrames.idx + 1) % TEST_CYCLE.length;
     testFrames.lastSwitch = now;
-    const name = TEST_CYCLE[testFrames.idx];
-    if (testFrames.imgEl && testFrames.urlName !== name) {
-      if (testFrames.url) URL.revokeObjectURL(testFrames.url);
-      testFrames.url = URL.createObjectURL(testFrames.blobs[name]);
-      testFrames.imgEl.src = testFrames.url;
-      testFrames.urlName = name;
-    }
   }
-  return TEST_CYCLE[testFrames.idx];
+  const name = TEST_CYCLE[testFrames.idx];
+  if (testFrames.imgEl && testFrames.urlName !== name) {
+    if (testFrames.url) URL.revokeObjectURL(testFrames.url);
+    testFrames.url = URL.createObjectURL(testFrames.blobs[name]);
+    testFrames.imgEl.src = testFrames.url;
+    testFrames.urlName = name;
+  }
+  return name;
 }
 
 function stop() {
   if (S.phase !== "running" && S.phase !== "starting") return;
+  releaseLight();
   LAMP.reset();
   S.phase = "stopping";
   S.generation++;
@@ -343,6 +354,7 @@ function onTrackEnded() {
   LAMP.reset();
   // 运行中设备断开
   if (S.phase !== "running") return;
+  releaseLight();
   S.generation++;
   S.historyGap = true; S.lastFaces = [];
   if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
@@ -457,7 +469,8 @@ function onResult(j) {
 
   const prevLabel = LAMP.current?.label;
   S.lastPrimary = j.primary || null;
-  const stable = LAMP.accept(S.lastPrimary, j.count, performance.now());
+  LAMP.apply(j.light);
+  const stable = LAMP.current;
   document.body.dataset.mood = stable?.label || "none";
   let pushed = false;
   if (stable) {
@@ -507,7 +520,6 @@ setInterval(() => {
   if (!base) return;
   const gap = Date.now() - base;
   if (gap > CFG.staleAfterMs && !S.stale) {
-    LAMP.reset();
     S.stale = true;
     S.historyGap = true;
     document.body.dataset.mood = 'none';
@@ -547,10 +559,10 @@ function updateStageStatus() {
 
 function renderCurrent() {
   const p = LAMP.current;
-  const on = S.phase === "running" && p && !S.stale;
+  const on = !!p;
   document.dispatchEvent(new Event('barometer-update'));
   els.currentPanel.classList.toggle("current-panel-stale", S.phase === "running" && S.stale && !!p);
-  if (S.phase !== "running") {
+  if (S.phase !== "running" && !p) {
     setCurrentLabel("待开始");
     els.currentLabel.dataset.on = "false";
     els.currentEn.textContent = "";
@@ -665,10 +677,16 @@ els.btn.addEventListener("click", () => {
 });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
+    releaseLight('pause');
     LAMP.reset(); S.historyGap = true; document.body.dataset.mood = "none"; renderCurrent();
     if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
   } else if (S.phase === "running" && !S.submitTimer) {
-    S.submitTimer = setInterval(submitTick, CFG.submitIntervalMs);
+    const id=S.runId;
+    void lightSession('resume',id).then(light=>{
+      if(S.runId===id&&S.phase==='running'&&!document.hidden){
+        LAMP.apply(light);S.submitTimer=setInterval(submitTick,CFG.submitIntervalMs);
+      }
+    }).catch(err=>{if(S.runId===id){stop();setBanner('warn','light-owner',err.message);}});
   }
 });
 window.addEventListener("pagehide", () => { if (S.phase === "running" || S.phase === 'starting') stop(); });
@@ -681,13 +699,3 @@ renderCurrent();
 renderTimeline(false);
 void refreshSvcBadge();
 setInterval(() => { if (S.phase === "idle") void refreshSvcBadge(); }, 30000);
-
-setInterval(() => {
-  if (S.phase !== 'running' || document.hidden) return;
-  const previous = LAMP.current;
-  LAMP.tick(performance.now());
-  if (previous && !LAMP.current) {
-    S.historyGap = true; document.body.dataset.mood = 'none'; renderCurrent();
-    renderComment('暂未确认到稳定表情，灯光已淡出。');
-  }
-}, 250);

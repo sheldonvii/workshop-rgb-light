@@ -1,43 +1,63 @@
-/* Confirm by brief continuity or a recent majority; raw model output stays separate. */
-(function(root){
-  class LightController {
-    constructor(){this.confirmMs=300;this.holdMs=600;this.graceMs=900;this.windowMs=1200;this.reset();}
-    reset(){this.current=null;this.candidate=null;this.candidateAt=0;this.samples=0;this.recent=[];this.lastChange=-Infinity;this.lastSample=null;this.invalidAt=null;this.status='waiting';}
-    clearOutput(){this.current=null;this.candidate=null;this.samples=0;this.recent=[];this.status='waiting';}
-    tick(now){
-      if(this.lastSample!==null && now-this.lastSample>1000){this.candidate=null;this.samples=0;this.recent=[];}
-      this.recent=this.recent.filter(sample=>now-sample.at<=this.windowMs);
-      const lost=this.invalidAt!==null?this.invalidAt:this.lastSample===null?now:this.lastSample+1000;
-      if(now-lost>=this.graceMs){this.clearOutput();this.status='expired';}
-      return this.current;
-    }
-    accept(p,count,now){
-      // Repeated delivery of the same sample must not add votes or advance state.
-      if(this.lastSample!==null && now<=this.lastSample)return this.current;
-      this.tick(now);
-      this.lastSample=now;
-      const reliable=count===1&&p&&!p.uncertain;
-      if(count!==1)this.recent=[];
-      else this.recent.push({at:now,label:reliable?p.label:null});
-      if(count!==1||!p||p.uncertain){
-        this.candidate=null;this.samples=0;
-        if(this.invalidAt===null)this.invalidAt=now;
-        this.status=this.current?'holding':'waiting';
-        this.tick(now);return this.current;
-      }
-      this.invalidAt=null;
-      if(this.current?.label===p.label){this.current=p;this.candidate=null;this.samples=0;this.status='stable';return this.current;}
-      if(this.candidate!==p.label){this.candidate=p.label;this.candidateAt=now;this.samples=1;}else this.samples++;
-      this.status=this.current?'holding':'confirming';
-      const continuous=now-this.candidateAt>=this.confirmMs && this.samples>=2;
-      const votes=this.recent.filter(sample=>sample.label===p.label).length;
-      const repeated=votes>=3 && votes/this.recent.length>=.75;
-      if((continuous||repeated) && now-this.lastChange>=this.holdMs){
-        this.current=p;this.lastChange=now;this.candidate=null;this.samples=0;this.recent=[];this.status='stable';
-      }
-      return this.current;
-    }
+/* The browser mirrors backend state; it never decides the physical lamp color. */
+class LightController {
+  constructor() { this.reset(); }
+  reset() { this.current=null;this.status='waiting';this.snapshot=null; }
+  apply(light) {
+    if (!light) return;
+    if (this.snapshot?.instance===light.instance && this.snapshot.sample_ms>light.sample_ms) return;
+    this.snapshot=light;this.current=light.current;this.status=light.status;
   }
-  root.LightController=LightController;
-  if(typeof module!=='undefined')module.exports=LightController;
-})(typeof window!=='undefined'?window:globalThis);
+}
+
+let lightSessionQueue=Promise.resolve();
+function lightSession(action,runId,keepalive=false) {
+  if(!runId)return Promise.resolve(null);
+  const request=async()=>{
+    const r=await fetch('/api/light/session',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({action,run_id:runId}),keepalive,signal:AbortSignal.timeout(3000)});
+    const data=await r.json();
+    if(!data.ok)throw Error(data.error?.message||'灯光会话连接失败');
+    return data.light;
+  };
+  const next=lightSessionQueue.then(request,request);
+  lightSessionQueue=next.catch(()=>null);
+  return next;
+}
+
+function releaseLight(action='stop') {
+  const id=S.runId;
+  if(id)void lightSession(action,id,true).catch(()=>{});
+}
+
+async function pollLight() {
+  try {
+    if(!document.hidden){
+      const r=await fetch('/api/light',{cache:'no-store',signal:AbortSignal.timeout(2000)});
+      if(!r.ok)throw Error('灯光服务不可达');
+      const data=await r.json();
+      const previous=LAMP.current?.label;
+      LAMP.apply(data.light);
+      if(previous&&!LAMP.current)S.historyGap=true;
+      renderCurrent();
+    }
+  } catch {
+    if(LAMP.snapshot)LAMP.snapshot.device={status:'unavailable',message:'灯光服务不可达'};
+    LAMP.current=null;LAMP.status='waiting';
+    document.dispatchEvent(new Event('barometer-update'));
+  } finally { setTimeout(pollLight,100); }
+}
+
+let lightHeartbeatBusy=false;
+setInterval(async()=>{
+  if(typeof S==='undefined'||S.phase!=='running'||document.hidden||lightHeartbeatBusy)return;
+  const id=S.runId;lightHeartbeatBusy=true;
+  try {
+    const light=await lightSession('start',id);
+    if(S.runId===id)LAMP.apply(light);
+  } catch(err) {
+    if(S.runId===id&&String(err.message).includes('另一页面')){
+      stop();setBanner('warn','light-owner',err.message);
+    }
+  } finally {lightHeartbeatBusy=false;}
+},2000);
+window.addEventListener('DOMContentLoaded',()=>void pollLight());
