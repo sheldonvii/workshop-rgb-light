@@ -17,8 +17,9 @@ const CFG = {
 };
 
 const MOOD_COLOR = {
-  happy: "#F2C14E", surprise: "#5BC8D8", neutral: "#7D93AD",
-  sad: "#5B7DC8", angry: "#D95D4E", fear: "#8E7CC8", disgust: "#7FA35B",
+  happy: "#F4CE76", surprise: "#F7AD8A", neutral: "#8ADAC6",
+  sad: "#8AB2ED", angry: "#ED8F92", fear: "#B7A2E4", disgust: "#C0D98B",
+  contempt: "#E7AACF",
 };
 
 /* 隔离的测试帧源模式（仅 ?frames=test 显式开启；正式入口默认摄像头，不受影响）。
@@ -44,6 +45,8 @@ const els = {
 
 const ICONS = window.__ICONS || {};  // index.html 内联的 Lucide path 数据
 
+const LAMP = new LightController();
+
 const S = {
   phase: "idle",            // idle | starting | running | stopping
   runId: null,
@@ -66,6 +69,10 @@ const S = {
   lastTiming: null,
   e2eMs: 0,
   svcState: "loading",
+  generation: 0,
+  encoding: false,
+  historyGap: true,
+  lastFaces: [],
 };
 
 /* ---------------- 图标 ---------------- */
@@ -79,7 +86,7 @@ function setBanner(kind, id, html, action) {
   S.bannerKind = kind; S.bannerId = id;
   els.banner.dataset.kind = kind === "danger" ? "danger" : "warn";
   els.bannerIcon.innerHTML = icon(kind === "danger" ? "triangle-alert" : "info", 18);
-  els.bannerText.innerHTML = html;
+  els.bannerText.textContent = html.replace(/<[^>]*>/g, '');
   if (action) {
     els.bannerBtn.hidden = false;
     els.bannerBtn.querySelector("span").textContent = action.label;
@@ -101,23 +108,25 @@ function setSvc(state, text) {
   els.svcText.textContent = text;
 }
 function setMainButton(mode) {
-  // mode: start（可点开始）| busy（初始化中，禁用）| stop（可点停止）
+  // Initialization stays cancellable while the permission prompt is pending.
   if (mode === "start") {
     els.btn.disabled = false;
     els.btn.className = "btn btn-primary";
     els.btnIcon.innerHTML = icon("play", 17);
     els.btnLabel.textContent = "开始体验";
   } else if (mode === "busy") {
-    els.btn.disabled = true;
+    els.btn.disabled = false;
     els.btn.className = "btn btn-primary";
     els.btnIcon.innerHTML = icon("loader-circle", 17);
-    els.btnLabel.textContent = "初始化…";
+    els.btnLabel.textContent = "取消开启";
   } else {
     els.btn.disabled = false;
     els.btn.className = "btn btn-ghost";
     els.btnIcon.innerHTML = icon("square", 16);
     els.btnLabel.textContent = "停止";
   }
+  updateStageStatus();
+  document.dispatchEvent(new Event('barometer-update'));
 }
 
 /* ---------------- 服务健康 ---------------- */
@@ -148,6 +157,7 @@ async function refreshSvcBadge() {
 async function start() {
   if (S.phase !== "idle") return;
   S.phase = "starting";
+  const generation = ++S.generation;
   setMainButton("busy");
   clearBanner();
 
@@ -155,7 +165,9 @@ async function start() {
   let health;
   try {
     health = await fetchHealth(5000);
+    if (generation !== S.generation) return;
   } catch {
+    if (generation !== S.generation) return;
     S.phase = "idle"; setMainButton("start"); setSvc("error", "推理服务不可达");
     setBanner("danger", "svc",
       "无法连接推理服务。请确认服务已启动（在工程目录执行 <code>./run.sh</code>），然后重试。",
@@ -175,6 +187,7 @@ async function start() {
     return;
   }
   setSvc("ready", "推理服务就绪");
+  if (typeof applyModelInfo === 'function') void applyModelInfo(health.body);
 
   // 1.5) 隔离测试帧源：跳过摄像头，用官方测试图走同一推理接口
   if (FRAME_TEST) {
@@ -185,11 +198,13 @@ async function start() {
         testFrames.blobs[name] = await r.blob();
       }
     } catch (err) {
+      if (generation !== S.generation) return;
       S.phase = "idle"; setMainButton("start");
       setBanner("danger", "cam", `测试帧源加载失败（${err.message}）。请确认 web/test-frames/ 完整。`);
       return;
     }
-    S.trackInfo = { w: 1280, h: 720, fps: 30, label: "测试帧源（官方测试图）" };
+    if (generation !== S.generation) return;
+    S.trackInfo = { w: 1280, h: 720, fps: 0, label: "测试帧源（官方测试图）" };
     beginRunning();
     setBanner("warn", "testsrc",
       "测试帧源模式：画面与结果来自官方测试图的真实推理，非摄像头采集。关闭地址里的 ?frames=test 即回到正式入口。");
@@ -204,6 +219,7 @@ async function start() {
       audio: false,
     });
   } catch (err) {
+    if (generation !== S.generation) return;
     S.phase = "idle"; setMainButton("start");
     const name = err && err.name;
     if (name === "NotAllowedError") {
@@ -224,6 +240,7 @@ async function start() {
   }
 
   // 3) 确认轨道实际参数（必须真实 ≥1280×720，不以放大冒充）
+  if (generation !== S.generation) { stream.getTracks().forEach(t => t.stop()); return; }
   const track = stream.getVideoTracks()[0];
   const st = track.getSettings();
   S.trackInfo = { w: st.width || 0, h: st.height || 0, fps: st.frameRate || 0, label: track.label || "" };
@@ -238,8 +255,9 @@ async function start() {
 
   // 4) 预览 + 开始提交
   els.video.srcObject = stream;
-  try { await els.video.play(); } catch { /* autoplay muted 通常可放行 */ }
   S.stream = stream;
+  try { await els.video.play(); } catch { if (generation !== S.generation) return; stop(); setBanner('danger','cam','视频预览无法启动，请重试。'); return; }
+  if (generation !== S.generation) { stream.getTracks().forEach(t => t.stop()); return; }
   track.addEventListener("ended", onTrackEnded);
   beginRunning();
 }
@@ -247,9 +265,12 @@ async function start() {
 function beginRunning() {
   S.phase = "running";
   S.runId = (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+  LAMP.reset();
   S.seq = 0; S.lastAcceptedSeq = 0;
   S.lastOkTs = 0; S.failCount = 0; S.stale = false;
   S.accepted = [];
+  S.historyGap = true;
+  S.lastPrimary = null; S.lastCount = 0;
   S.runStartTs = Date.now();
   setMainButton("stop");
   els.stageIdle.hidden = true;
@@ -288,7 +309,11 @@ function currentTestFrame(now) {
 
 function stop() {
   if (S.phase !== "running" && S.phase !== "starting") return;
+  LAMP.reset();
   S.phase = "stopping";
+  S.generation++;
+  S.encoding = false;
+  S.historyGap = true;
   // 先停新帧、拒绝旧结果回写
   if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
   S.runId = null;
@@ -303,6 +328,7 @@ function stop() {
   S.phase = "idle";
   S.stale = false;
   S.lastPrimary = null; S.lastCount = 0;
+  S.lastFaces = [];
   document.body.dataset.mood = "none";
   els.stageIdle.hidden = false;
   setMainButton("start");
@@ -314,8 +340,11 @@ function stop() {
 }
 
 function onTrackEnded() {
+  LAMP.reset();
   // 运行中设备断开
   if (S.phase !== "running") return;
+  S.generation++;
+  S.historyGap = true; S.lastFaces = [];
   if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
   S.runId = null;
   if (S.inFlight) { S.inFlight.abort(); S.inFlight = null; }
@@ -340,7 +369,7 @@ const capCanvas = document.createElement("canvas");
 const capCtx = capCanvas.getContext("2d", { willReadFrequently: false });
 
 function submitTick() {
-  if (S.phase !== "running" || document.hidden || S.inFlight) return;
+  if (S.phase !== "running" || document.hidden || S.inFlight || S.encoding) return;
   if (FRAME_TEST) {
     const name = currentTestFrame(performance.now());
     const blob = testFrames.blobs[name];
@@ -353,12 +382,17 @@ function submitTick() {
   capCanvas.width = v.videoWidth;
   capCanvas.height = v.videoHeight;
   capCtx.drawImage(v, 0, 0);   // 预览与取帧共用同一条视频流；推理帧不做镜像
+  const generation = S.generation;
+  S.encoding = true;
   capCanvas.toBlob((blob) => {
-    if (blob) void sendFrame(blob);
+    if (generation !== S.generation) return;
+    S.encoding = false;
+    if (blob && S.phase === 'running' && !document.hidden && !S.inFlight) void sendFrame(blob);
   }, "image/jpeg", CFG.jpegQuality);
 }
 
 async function sendFrame(blob) {
+  if (S.phase !== 'running' || S.inFlight) return;
   const seq = ++S.seq;
   const runId = S.runId;
   const ctl = new AbortController();
@@ -374,11 +408,12 @@ async function sendFrame(blob) {
     });
     const j = await r.json().catch(() => null);
     clearTimeout(timer);
-    S.inFlight = null;
+    if (S.inFlight === ctl) S.inFlight = null;
 
     if (S.phase !== "running" || S.runId !== runId) return;      // 跨运行：丢弃
     if (!j) { onFail(); return; }
     if (j.ok) {
+      if (j.run_id !== runId) return;
       if (j.seq <= S.lastAcceptedSeq) return;                    // 过期：丢弃
       S.lastAcceptedSeq = j.seq;
       S.e2eMs = Math.round(performance.now() - sentTs);
@@ -390,7 +425,7 @@ async function sendFrame(blob) {
     }
   } catch (err) {
     clearTimeout(timer);
-    S.inFlight = null;
+    if (S.inFlight === ctl) S.inFlight = null;
     if (S.phase !== "running" || S.runId !== runId) return;
     if (err && err.name === "AbortError") { onFail("推理请求超时"); return; }
     onFail();
@@ -414,37 +449,35 @@ function onResult(j) {
   if (S.svcState !== "ready") setSvc("ready", "推理服务就绪");
 
   S.lastCount = j.count;
+  S.lastFaces = j.faces || [];
   S.lastTiming = j.timing || null;
   const now = Date.now();
   S.accepted.push(now);
   while (S.accepted.length && now - S.accepted[0] > 10000) S.accepted.shift();
 
-  const prevLabel = S.lastPrimary && S.lastPrimary.label;
+  const prevLabel = LAMP.current?.label;
   S.lastPrimary = j.primary || null;
-
-  // 氛围：仅跟随真实有效结果
-  if (j.primary) document.body.dataset.mood = j.primary.mood || "neutral";
-  else document.body.dataset.mood = "none";
-
-  // 时间线：只记录单人有效识别；标签变化新增节点，相同标签更新持续
+  const stable = LAMP.accept(S.lastPrimary, j.count, performance.now());
+  document.body.dataset.mood = stable?.label || "none";
   let pushed = false;
-  if (j.primary) {
+  if (stable) {
     const tail = S.timeline[S.timeline.length - 1];
-    if (tail && tail.label === j.primary.label) {
-      tail.t1 = now; tail.score = j.primary.score;
+    if (tail && !S.historyGap && tail.runId === S.runId && tail.label === stable.label) {
+      tail.t1 = now; tail.score = stable.score;
     } else {
-      S.timeline.push({
-        label: j.primary.label, zh: j.primary.label_zh, mood: j.primary.mood,
-        score: j.primary.score, t0: now, t1: now,
-      });
+      S.timeline.push({label:stable.label, zh:stable.label_zh, mood:stable.label,
+        score:stable.score,t0:now,t1:now,runId:S.runId,scoreType:stable.score_type});
       if (S.timeline.length > CFG.timelineKeepMax) S.timeline.shift();
       pushed = true;
     }
-    renderComment(changeComment(prevLabel, j.primary));
+    S.historyGap = false;
+    renderComment(LAMP.status === 'stable' ? changeComment(prevLabel, stable) : '保留上一种灯色，等待下一次稳定确认。');
   } else {
-    renderComment(j.count === 0
-      ? (S.timeline.length ? "人离开了画面，等待入镜。" : "还没有人入镜。走到镜头前，保持面部可见。")
-      : `画面中有 ${j.count} 张脸。请保持单人入镜，其他人暂时退后。`);
+    S.historyGap = true;
+    renderComment(stable ? '保留上一种灯色，等待下一次稳定确认。' : j.primary?.uncertain
+      ? '几个表情分数接近，正在继续观察。' : j.count === 0
+      ? '看向镜头，灯光会在表情稳定后亮起。' : j.count > 1
+      ? '请保持单人入镜。' : '正在确认表情，保持自然就好。');
   }
 
   if (S.stale) { S.stale = false; }
@@ -474,7 +507,12 @@ setInterval(() => {
   if (!base) return;
   const gap = Date.now() - base;
   if (gap > CFG.staleAfterMs && !S.stale) {
+    LAMP.reset();
     S.stale = true;
+    S.historyGap = true;
+    document.body.dataset.mood = 'none';
+    clearOverlay();
+    updateStageStatus();
     renderCurrent();
     renderComment(S.lastOkTs
       ? "结果更新中断，正在尝试恢复。若持续无更新，请检查推理服务。"
@@ -489,7 +527,7 @@ function updateStageStatus() {
     el.hidden = false;
     el.dataset.s = "wait";
     els.stageStatusIcon.innerHTML = icon("camera-off", 16);
-    els.stageStatusText.textContent = "未启动";
+    els.stageStatusText.textContent = S.phase === 'starting' ? '正在开启' : "未启动";
     return;
   }
   if (S.lastCount === 0) {
@@ -508,11 +546,12 @@ function updateStageStatus() {
 }
 
 function renderCurrent() {
-  const p = S.lastPrimary;
+  const p = LAMP.current;
   const on = S.phase === "running" && p && !S.stale;
+  document.dispatchEvent(new Event('barometer-update'));
   els.currentPanel.classList.toggle("current-panel-stale", S.phase === "running" && S.stale && !!p);
   if (S.phase !== "running") {
-    els.currentLabel.textContent = "待开始";
+    setCurrentLabel("待开始");
     els.currentLabel.dataset.on = "false";
     els.currentEn.textContent = "";
     els.currentScore.textContent = "";
@@ -521,31 +560,35 @@ function renderCurrent() {
     return;
   }
   if (!p) {
-    els.currentLabel.textContent = "未识别";
+    setCurrentLabel(S.lastPrimary?.uncertain ? "观察中" : S.lastCount === 1 ? "确认中" : "等你入镜");
     els.currentLabel.dataset.on = "false";
     els.currentEn.textContent = "";
     els.currentScore.textContent = "";
     els.currentTime.textContent = "";
-    els.currentNote.textContent = S.lastCount === 0 ? "等待入镜" : "多人入镜时不做识别";
+    els.currentNote.textContent = S.stale ? '结果已失效，等待恢复' : S.lastCount === 0 ? "等待入镜" : S.lastCount === 1 ? "持续确认后点亮" : "多人入镜时不做识别";
     return;
   }
-  els.currentLabel.textContent = p.label_zh;
+  setCurrentLabel(p.uncertain ? '不确定' : p.label_zh);
   els.currentLabel.dataset.on = String(!!on);
-  els.currentEn.textContent = p.label;
-  els.currentScore.textContent = `模型分数 ${p.score}`;
-  els.currentTime.textContent = new Date().toLocaleTimeString("zh-CN", { hour12: false });
-  els.currentNote.textContent = S.stale ? "结果已失效，等待恢复" : "实时";
+  els.currentEn.textContent = p.uncertain ? `较接近${p.label_zh}` : p.label;
+  els.currentScore.textContent = LAMP.status !== "stable" ? "上一稳定结果" : p.score_type === 'softmax' ? `模型分数 ${(p.score * 100).toFixed(1)}%` : `原始分数 ${p.score}`;
+  els.currentTime.textContent = new Date(S.lastOkTs).toLocaleTimeString("zh-CN", { hour12: false });
+  els.currentNote.textContent = S.stale ? "结果失效" : LAMP.status !== "stable" ? "保持灯色" : "已稳定确认";
 }
 
 function renderComment(text) {
   if (text) els.comment.textContent = text;
 }
 
+function setCurrentLabel(text) {
+  if (els.currentLabel.textContent !== text) els.currentLabel.textContent = text;
+}
+
 function renderTimeline(markNew) {
   const items = S.timeline.slice(-CFG.timelineRenderMax).reverse();
   els.timelineEmpty.hidden = items.length > 0;
   els.timeline.innerHTML = items.map((it, i) => {
-    const cur = i === 0 && S.lastPrimary && S.lastPrimary.label === it.label && !S.stale;
+    const cur = i === 0 && S.phase === 'running' && !S.historyGap && LAMP.current && LAMP.current.label === it.label && !S.stale;
     const dur = Math.max(0, Math.round((it.t1 - it.t0) / 1000));
     const t = new Date(it.t0).toLocaleTimeString("zh-CN", { hour12: false });
     const cls = ["tl-row", cur ? "tl-current" : "", markNew && i === 0 ? "tl-new" : ""].join(" ").trim();
@@ -553,7 +596,7 @@ function renderTimeline(markNew) {
       <span class="tl-time">${t}</span>
       <span class="tl-dot" aria-hidden="true"></span>
       <span class="tl-label">${it.zh}<span class="en">${it.label}</span></span>
-      <span class="tl-score">${dur > 0 ? `${dur}s` : ""} · ${it.score}</span>
+      <span class="tl-score">${dur > 0 ? `${dur} 秒` : '刚刚'}${it.scoreType === 'softmax' ? ` / ${(it.score*100).toFixed(0)}%` : ''}</span>
     </li>`;
   }).join("");
 }
@@ -565,12 +608,13 @@ function updateMeta() {
       : "";
     return;
   }
-  const rate = (S.accepted.length / 10).toFixed(1);
+  const elapsed = Math.max(1, Math.min(10, (Date.now()-S.runStartTs)/1000));
+  const rate = (S.accepted.length / elapsed).toFixed(1);
   const t = S.lastTiming;
   els.stageMeta.textContent =
-    `${S.trackInfo.w}×${S.trackInfo.h} @${Math.round(S.trackInfo.fps)}` +
-    ` · 推理 ${rate} 次/秒 · 端到端 ${S.e2eMs}ms` +
-    (t ? ` · 检测 ${t.detect_ms}ms 分类 ${t.emotion_ms}ms` : "");
+    `${FRAME_TEST ? '测试图片' : '采集'} ${S.trackInfo.w}×${S.trackInfo.h}` +
+    (FRAME_TEST ? '' : ` ${Math.round(S.trackInfo.fps)} fps`) +
+    ` / 更新 ${rate} 次/秒 / 延迟 ${S.e2eMs} ms`;
 }
 
 /* ---------------- 叠加框 ---------------- */
@@ -593,17 +637,18 @@ function drawOverlay(faces, primary) {
   ctx.lineWidth = Math.max(2, c.width / 480);
   for (const f of faces) {
     const w = f.x2 - f.x1, h = f.y2 - f.y1;
+    const displayX = document.body.dataset.mirror === 'false' ? f.x1 : fw - f.x2;
     const isPrimary = primary && primary.box &&
       Math.abs(primary.box[0] - f.x1) < 1 && Math.abs(primary.box[1] - f.y1) < 1;
     ctx.strokeStyle = multi ? "#E5534B" : "#E8B34B";
-    ctx.strokeRect(f.x1, f.y1, w, h);
+    ctx.strokeRect(displayX, f.y1, w, h);
     if (!multi && isPrimary && primary) {
-      const text = `${primary.label_zh} ${primary.score}`;
+      const text = primary.uncertain ? '不确定' : primary.label_zh;
       ctx.font = `600 ${Math.max(14, c.width / 46)}px "Noto Sans CJK SC", sans-serif`;
       const tw = ctx.measureText(text).width;
       const pad = Math.max(6, c.width / 160);
       const bh = Math.max(24, c.width / 30);
-      const bx = f.x1, by = Math.max(0, f.y1 - bh - 4);
+      const bx = Math.max(0, Math.min(displayX, fw - tw - pad*2)), by = Math.max(0, f.y1 - bh - 4);
       ctx.fillStyle = "rgba(13,18,24,0.82)";
       ctx.fillRect(bx, by, tw + pad * 2, bh);
       ctx.fillStyle = "#E8B34B";
@@ -615,17 +660,18 @@ function drawOverlay(faces, primary) {
 
 /* ---------------- 事件 ---------------- */
 els.btn.addEventListener("click", () => {
-  if (S.phase === "running") stop();
+  if (S.phase === "running" || S.phase === 'starting') stop();
   else if (S.phase === "idle") void start();
 });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
+    LAMP.reset(); S.historyGap = true; document.body.dataset.mood = "none"; renderCurrent();
     if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
   } else if (S.phase === "running" && !S.submitTimer) {
     S.submitTimer = setInterval(submitTick, CFG.submitIntervalMs);
   }
 });
-window.addEventListener("pagehide", () => { if (S.phase === "running") stop(); });
+window.addEventListener("pagehide", () => { if (S.phase === "running" || S.phase === 'starting') stop(); });
 
 /* ---------------- 初始 ---------------- */
 document.body.dataset.mood = "none";
@@ -635,3 +681,13 @@ renderCurrent();
 renderTimeline(false);
 void refreshSvcBadge();
 setInterval(() => { if (S.phase === "idle") void refreshSvcBadge(); }, 30000);
+
+setInterval(() => {
+  if (S.phase !== 'running' || document.hidden) return;
+  const previous = LAMP.current;
+  LAMP.tick(performance.now());
+  if (previous && !LAMP.current) {
+    S.historyGap = true; document.body.dataset.mood = 'none'; renderCurrent();
+    renderComment('暂未确认到稳定表情，灯光已淡出。');
+  }
+}, 250);

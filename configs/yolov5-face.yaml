@@ -1,8 +1,8 @@
 # YOLOv5-Face 人脸检测配置（基于 /opt/spacemit-ai-gateway/configs/vision/yolov5-face.yaml，仅改路径）
 # 模型来源: https://archive.spacemit.com/spacemit-ai/model_zoo/vision/yolov5-face/yolov5n-face_cut.q.onnx
 # md5: 095598f3a279b5f004cbe0b44fab660b
-model_path: /home/bianbu/workshop-rgb-light/models/yolov5n-face_cut.q.onnx
-test_image: /home/bianbu/workshop-rgb-light/tests/assets/006_test.jpg
+model_path: models/yolov5n-face_cut.q.onnx
+test_image: web/test-frames/multi.jpg
 class: deploy.yolov5_face.YOLOv5FaceDetector
 default_params:
   conf_thres: 0.25

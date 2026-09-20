@@ -1,9 +1,9 @@
 # Emotion 情绪识别模型配置（基于 /opt/spacemit-ai-gateway/configs/vision/emotion.yaml，仅改路径）
 # 模型来源: https://archive.spacemit.com/spacemit-ai/model_zoo/vision/resnet/emotion_resnet50_final.q.onnx
 # md5: 982cb7e6d38842750887560a8d7f363a
-model_path: /home/bianbu/workshop-rgb-light/models/emotion_resnet50_final.q.onnx
-label_file_path: /home/bianbu/workshop-rgb-light/configs/emotion.txt
-test_image: /home/bianbu/workshop-rgb-light/tests/assets/003_face0.png
+model_path: models/emotion_resnet50_final.q.onnx
+label_file_path: configs/emotion.txt
+test_image: web/test-frames/single.jpg
 # image_size 指 emotion_model 的输入尺寸
 image_size: [224, 224]
 class: deploy.emotion.EmotionRecognizer

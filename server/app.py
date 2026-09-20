@@ -2,9 +2,9 @@
 """情绪晴雨表 推理与页面服务（单板一体化，仅依赖本目录 .venv）。
 
 数据链路：浏览器抓帧(JPEG) → POST /api/infer → 人脸检测(yolov5n-face)
-→ 原图坐标裁剪 → 表情分类(emotion_resnet50) → JSON。
-两模型均由 SpacemiT 官方引擎 spacemit_vision 0.1.2（SpaceMITExecutionProvider, NPU）执行，
-模型文件来自 archive.spacemit.com 官方发布（md5 见 configs/*.yaml 注释）。
+→ 原图坐标裁剪 → 表情分类(HSEmotion B0/B2，或原版 ResNet50) → JSON。
+检测使用 SpacemiT Vision 0.1.2 的 SpaceMITExecutionProvider。
+HSEmotion 使用板上已有 ONNX Runtime 的 CPUExecutionProvider，来源与校验值见 scripts/download_models.py。
 
 接口契约：
   GET  /api/health  → {ok, state: loading|ready|error, models, engine, message?}
@@ -18,12 +18,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 import io
 import json
 import logging
+import signal
 import threading
 import time
 import traceback
+from emotion_models import EmotionModel, REGISTRY, LABELS
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -54,7 +57,7 @@ EMOTIONS = {
     "happy":    {"zh": "开心", "mood": "happy"},
     "sad":      {"zh": "难过", "mood": "sad"},
     "angry":    {"zh": "生气", "mood": "angry"},
-    "fear":     {"zh": "紧张", "mood": "fear"},
+    "fear":     {"zh": "害怕", "mood": "fear"},
     "disgust":  {"zh": "厌恶", "mood": "disgust"},
     "surprise": {"zh": "惊讶", "mood": "surprise"},
 }
@@ -65,9 +68,9 @@ log = logging.getLogger("barometer")
 
 
 class ModelBundle:
-    """两个官方模型的加载与串联推理。state: loading → ready | error"""
+    """Detector and selected emotion classifier. state: loading -> ready | error."""
 
-    def __init__(self) -> None:
+    def __init__(self, emotion_key='hse-b0') -> None:
         self.state = "loading"
         self.message = ""
         self.load_ms: dict[str, float] = {}
@@ -75,6 +78,8 @@ class ModelBundle:
         self._emo = None
         self._infer_lock = threading.Lock()
         self._loaded_lock = threading.Event()
+        self.emotion_key = emotion_key
+        self.emotion_info = {}
 
     def load_async(self) -> None:
         threading.Thread(target=self._load, name="model-load", daemon=True).start()
@@ -86,7 +91,8 @@ class ModelBundle:
 
             for key, cfg in (("face", FACE_CFG), ("emotion", EMO_CFG)):
                 t0 = time.perf_counter()
-                svc = VisionServiceNative.create(str(cfg), timing_print_to_stdout=False)
+                svc = (EmotionModel(self.emotion_key) if key == 'emotion' and self.emotion_key != 'official'
+                       else VisionServiceNative.create(str(cfg), timing_print_to_stdout=False))
                 self.load_ms[key] = round((time.perf_counter() - t0) * 1000, 1)
                 if key == "face":
                     self._det = svc
@@ -98,7 +104,11 @@ class ModelBundle:
 
             dummy = np.zeros((64, 64, 3), dtype=np.uint8)
             self._det.infer_image(dummy)
-            self._emo.infer_image(dummy)
+            if self.emotion_key == 'official':
+                self._emo.infer_image(dummy)
+            else:
+                self._emo.predict(dummy)
+            self.emotion_info = self._emotion_info()
             self.state = "ready"
         except Exception as exc:  # 模型加载失败：health 必须如实上报
             self.state = "error"
@@ -112,11 +122,45 @@ class ModelBundle:
             "ok": self.state == "ready",
             "state": self.state,
             "message": self.message,
-            "engine": ENGINE_VERSION,
-            "models": {**MODEL_INFO, },
+            "engine": ENGINE_VERSION if self.emotion_key == 'official' else f'{ENGINE_VERSION} face; ONNX Runtime CPUExecutionProvider emotion',
+            "models": {**MODEL_INFO, 'emotion': self.emotion_info},
             "load_ms": self.load_ms,
-            "labels": EMOTION_LABELS,
+            "labels": EMOTION_LABELS if self.emotion_key == 'official' else LABELS,
+            "emotion_key": self.emotion_key,
+            "available_models": ['hse-b0', 'hse-b2', 'official'],
         }
+
+    def _emotion_info(self):
+        if self.emotion_key == 'official':
+            return {**MODEL_INFO['emotion'], 'key': 'official', 'score_type': 'logit', 'labels': EMOTION_LABELS}
+        return self._emo.info
+
+    def switch(self, key):
+        if key not in (*REGISTRY, 'official'):
+            return 400, {'ok': False, 'error': {'code': 'bad_model', 'message': '未知模型'}}
+        if self.state != 'ready' or not self._infer_lock.acquire(timeout=6):
+            return 409, {'ok': False, 'error': {'code': 'busy', 'message': '请停止体验后再切换模型'}}
+        try:
+            if key != self.emotion_key:
+                import cv2
+                import numpy as np
+                if key == 'official':
+                    from spacemit_vision import VisionServiceNative
+                    candidate = VisionServiceNative.create(str(EMO_CFG), timing_print_to_stdout=False)
+                    candidate.infer_image(np.zeros((64,64,3), dtype=np.uint8))
+                else:
+                    candidate = EmotionModel(key)
+                    candidate.predict(np.zeros((64,64,3), dtype=np.uint8))
+                old = self._emo
+                self._emo, self.emotion_key = candidate, key
+                self.emotion_info = self._emotion_info()
+                old.release()
+            return 200, self.health()
+        except Exception as exc:
+            log.exception('model switch failed')
+            return 500, {'ok': False, 'error': {'code': 'model_failed', 'message': str(exc)}}
+        finally:
+            self._infer_lock.release()
 
     def infer(self, jpeg: bytes) -> dict:
         """完整串联。调用方需已持有 _infer_lock。"""
@@ -153,7 +197,13 @@ class ModelBundle:
             x2, y2 = min(w, int(d.x2)), min(h, int(d.y2))
             if x2 - x1 >= 8 and y2 - y1 >= 8:
                 crop = img[y1:y2, x1:x2]
-                status2, res = self._emo.infer_image(crop)
+                if self.emotion_key != 'official':
+                    primary = self._emo.predict(crop)
+                    primary['box'] = [round(float(d.x1),1), round(float(d.y1),1), round(float(d.x2),1), round(float(d.y2),1)]
+                    res = None
+                    status2 = VisionServiceStatus.OK
+                else:
+                    status2, res = self._emo.infer_image(crop)
                 if status2 != VisionServiceStatus.OK:
                     raise RuntimeError(f"emotion classify failed: {status2}")
                 if res:
@@ -165,6 +215,7 @@ class ModelBundle:
                         "label_zh": EMOTIONS.get(label, {}).get("zh", label),
                         "mood": EMOTIONS.get(label, {}).get("mood", "neutral"),
                         "score": round(float(r.score), 4),  # 模型原始分数（logit，非概率，可>1）
+                        "score_type": "logit", "model": "official", "uncertain": False,
                         "box": [round(float(d.x1), 1), round(float(d.y1), 1),
                                 round(float(d.x2), 1), round(float(d.y2), 1)],
                     }
@@ -203,12 +254,14 @@ class ModelBundle:
             self._infer_lock.release()
 
     def release(self) -> None:
-        for svc in (self._det, self._emo):
-            try:
-                if svc is not None:
-                    svc.release()
-            except Exception:
-                pass
+        # Native sessions must outlive any request currently executing them.
+        with self._infer_lock:
+            for svc in (self._det, self._emo):
+                try:
+                    if svc is not None:
+                        svc.release()
+                except Exception:
+                    log.exception('model release failed')
 
 
 MODELS = ModelBundle()
@@ -239,7 +292,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # The browser may abort a frame when stopping the camera.
 
     def _send_file(self, path: Path) -> None:
         try:
@@ -266,12 +322,23 @@ class Handler(BaseHTTPRequestHandler):
         # 静态资源：只允许 web/ 目录内
         rel = path_only.lstrip("/")
         target = (WEB_DIR / rel).resolve()
-        if target.is_file() and str(target).startswith(str(WEB_DIR.resolve())):
+        if target.is_file() and target.is_relative_to(WEB_DIR.resolve()):
             self._send_file(target)
             return
         self._send_json(404, {"ok": False, "error": {"code": "not_found", "message": "资源不存在"}})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == '/api/model':
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+                if not 0 < n <= 256:
+                    raise ValueError('bad request')
+                key = json.loads(self.rfile.read(n))['model']
+                status, payload = MODELS.switch(key)
+                self._send_json(status, payload)
+            except (ValueError, KeyError, TypeError):
+                self._send_json(400, {'ok': False, 'error': {'code': 'bad_request', 'message': '模型参数无效'}})
+            return
         if self.path != "/api/infer":
             self._send_json(404, {"ok": False, "error": {"code": "not_found", "message": "接口不存在"}})
             return
@@ -295,15 +362,21 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    os.chdir(ROOT)  # Vision YAML paths are relative to the project root.
     ap = argparse.ArgumentParser(description="情绪晴雨表 Demo 服务")
     ap.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1，本机使用）")
     ap.add_argument("--port", type=int, default=8321, help="监听端口（默认 8321）")
+    ap.add_argument('--emotion-model', choices=['hse-b0', 'hse-b2', 'official'], default='hse-b0')
     args = ap.parse_args()
+    MODELS.emotion_key = args.emotion_model
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
-    MODELS.load_async()
-
     httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    def terminate(signum, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    MODELS.load_async()
     log.info("serving on http://%s:%d  (web dir: %s)", args.host, args.port, WEB_DIR)
     try:
         httpd.serve_forever()

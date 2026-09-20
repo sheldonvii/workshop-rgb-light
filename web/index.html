@@ -22,83 +22,31 @@ window.__ICONS = {
   "activity": '<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>'
 };
 </script>
+<script src="/lucide.min.js"></script>
 </head>
-<body data-mood="none">
-<div class="ambience" aria-hidden="true"></div>
-
-<header class="topbar">
-  <div class="brand">
-    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><path d="M9 9h.01"/><path d="M15 9h.01"/>
-    </svg>
-    <h1>情绪晴雨表</h1>
-    <span class="brand-sub">面部表现实时演示 · K3 本地推理</span>
-  </div>
-  <div class="top-right">
-    <span class="svc" id="svcBadge" data-s="loading" role="status">
-      <span class="dot" aria-hidden="true"></span><span id="svcText">正在连接推理服务…</span>
-    </span>
-    <button class="btn btn-primary" id="btnMain" type="button">
-      <span id="btnMainIcon" aria-hidden="true"></span><span id="btnMainLabel">开始体验</span>
-    </button>
-  </div>
-</header>
-
-<div class="banner" id="banner" hidden role="alert">
-  <span id="bannerIcon" aria-hidden="true"></span>
-  <div class="grow" id="bannerText"></div>
-  <button class="btn btn-ghost" id="bannerBtn" type="button" hidden><span>重试</span></button>
+<body data-mood="none" data-light="standby">
+<a class="skip-link" href="#experience">跳到体验区</a><div class="ambient" aria-hidden="true"></div>
+<div class="app-shell"><header class="topbar">
+<a class="brand" href="/" aria-label="情绪晴雨表首页"><span class="brand-mark"><i data-lucide="lightbulb"></i></span><span>情绪晴雨表<small>给表情一点颜色</small></span></a>
+<div class="top-right"><span class="svc" id="svcBadge" data-s="loading" role="status"><span class="dot" aria-hidden="true"></span><span id="svcText">连接中</span></span><button class="icon-button" id="themeToggle" aria-label="切换明暗主题" title="切换明暗主题"><i data-lucide="sun-moon"></i></button><button class="icon-button" id="infoToggle" aria-label="打开设置" title="设置" aria-controls="settingsDrawer" aria-expanded="false"><i data-lucide="sliders-horizontal"></i></button></div></header>
+<main id="experience"><div class="intro"><div><h1>让表情，亮起来。</h1><p>看向镜头，把此刻的表情调成一束光。</p></div><div class="studio-sticker" aria-hidden="true"><i data-lucide="sparkles"></i><span>今天的你<br>自带光芒</span></div></div>
+<div class="banner" id="banner" hidden role="alert"><span id="bannerIcon" aria-hidden="true"></span><div class="grow" id="bannerText"></div><button class="btn btn-ghost" id="bannerBtn" type="button" hidden><span>重试</span></button></div>
+<div class="experience-grid">
+<section class="camera-panel" aria-labelledby="cameraHeading"><div class="section-head"><h2 id="cameraHeading"><i data-lucide="camera"></i>这一刻的你</h2><label class="mirror-control"><input type="checkbox" id="mirrorToggle" checked>镜像</label></div>
+<div class="stage" id="stage"><video id="video" autoplay playsinline muted></video><canvas id="overlay" aria-hidden="true"></canvas><div class="stage-idle" id="stageIdle"><div class="portrait-guide" aria-hidden="true"><i data-lucide="scan-face"></i></div><h3>你的表情，是开关。</h3><p>开启镜头，让灯光回应你。</p><span class="privacy-note"><i data-lucide="camera-off"></i>摄像头尚未开启</span></div><div class="stage-status" id="stageStatus" data-s="wait" role="status"><span id="stageStatusIcon"></span><span id="stageStatusText">未启动</span></div></div>
+<div class="camera-controls"><button class="btn btn-primary" id="btnMain" type="button"><span id="btnMainIcon" aria-hidden="true"></span><span id="btnMainLabel">开始体验</span></button><p id="captureHint">单人入镜 · 画面仅在本机处理</p></div><div class="stage-meta" id="stageMeta" aria-live="off"></div><span class="photo-tab" aria-hidden="true">此刻限定</span></section>
+<section class="weather-panel" id="currentPanel" aria-labelledby="weatherHeading"><div class="section-head"><h2 id="weatherHeading">你的情绪灯光</h2><span class="current-note" id="currentNote">未启动</span></div><div class="barometer" id="barometer"><canvas id="weatherCanvas" aria-hidden="true"></canvas><div class="weather-center"><span class="weather-symbol" id="weatherSymbol"><i data-lucide="power"></i></span><div class="current-label" id="currentLabel" role="status" aria-live="polite" aria-atomic="true" data-on="false">待开始</div><div class="result-meta"><span class="en" id="currentEn"></span><span id="currentScore"></span></div></div></div><div class="light-caption"><span class="light-name"><i aria-hidden="true"></i><span id="lightName">待机光</span></span><span id="lightState">屏幕灯效 · 等你入镜</span></div><div class="observation"><p id="comment">开启镜头，看看这一刻会亮起什么颜色。</p><time id="currentTime"></time></div></section>
 </div>
-
-<main class="layout">
-  <section class="stage-panel" aria-label="摄像头画面">
-    <div class="stage" id="stage">
-      <video id="video" autoplay playsinline muted></video>
-      <canvas id="overlay" aria-hidden="true"></canvas>
-      <div class="stage-idle" id="stageIdle">
-        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/>
-        </svg>
-        <p>摄像头未启动。点击右上角“开始体验”，页面会先确认推理服务，再请求摄像头权限。</p>
-      </div>
-      <div class="stage-status" id="stageStatus" data-s="wait" role="status">
-        <span id="stageStatusIcon" aria-hidden="true"></span><span id="stageStatusText">未启动</span>
-      </div>
-      <div class="stage-meta" id="stageMeta" aria-live="off"></div>
-    </div>
-  </section>
-
-  <aside class="side">
-    <section class="panel" id="currentPanel" aria-label="当前状态">
-      <h2>当前状态</h2>
-      <div class="current-main">
-        <div class="current-label" id="currentLabel" data-on="false">待开始</div>
-        <div class="current-sub">
-          <span class="en" id="currentEn"></span>
-          <span id="currentScore"></span>
-          <span id="currentTime"></span>
-          <span class="current-note" id="currentNote">未启动</span>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel comment" aria-label="短评">
-      <h2>短评</h2>
-      <p id="comment">点击“开始体验”，对准镜头，页面会根据实际推理结果更新。</p>
-    </section>
-
-    <section class="panel" aria-label="历史变化">
-      <h2>历史变化</h2>
-      <p class="timeline-empty" id="timelineEmpty">还没有记录。单人入镜并出现有效识别后，这里会按时间列出变化。</p>
-      <ol class="timeline-list" id="timeline"></ol>
-    </section>
-  </aside>
+<section class="color-key" aria-label="表情与灯色对应"><span class="color-key-title">每种表情<br>都有颜色</span><div id="colorLegend"></div><span class="key-note">短暂确认即可<br>灯色柔和跟随</span></section>
+<section class="history-panel" aria-labelledby="historyHeading"><div class="section-head"><h2 id="historyHeading">这一刻的灯色记录</h2><button class="text-button" id="clearHistory" type="button" disabled><i data-lucide="rotate-ccw"></i>清空记录</button></div><div class="history-track"><p class="timeline-empty" id="timelineEmpty"><span class="empty-track" aria-hidden="true"></span>从第一个表情开始，收集你的这一刻。</p><ol class="timeline-list" id="timeline"></ol></div></section>
 </main>
-
-<footer class="foot">
-  仅描述画面中可见的面部表现，不推断真实心理状态，不作为医学判断。人脸检测 yolov5n-face 与表情分类 emotion_resnet50 均为 SpacemiT 官方量化模型，本地 NPU 推理（SpaceMITExecutionProvider）。模型分数为模型原始输出（logit，非概率）。
-</footer>
-
-<script src="/app.js"></script>
-</body>
-</html>
+<footer class="foot"><span>表情是此刻的一帧，不定义你的心情。</span><span>SpacemiT K3 · 本地识别</span></footer></div>
+<dialog id="settingsDrawer" class="settings-drawer" aria-labelledby="settingsTitle">
+<header class="drawer-head"><div><h2 id="settingsTitle">识别与灯光</h2><p>看实时判断，也给灯光留一点时间。</p></div><button id="closeSettings" class="icon-button" aria-label="关闭设置" autofocus><i data-lucide="x"></i></button></header>
+<div class="drawer-body">
+<section class="drawer-section"><h3>灯光节奏</h3><div class="timing-spec"><span>连续确认<strong>300 毫秒</strong></span><span>换色间隔<strong>600 毫秒</strong></span><span>换色渐变<strong>450 毫秒</strong></span></div><p>连续可靠识别达到 300 毫秒，或最近 1.2 秒内同一表情出现至少 3 次、占全部结果的 75%，即可确认。重复确认允许中间短暂出现其他结果，无需一直保持表情。短暂不确定时保留旧色，900 毫秒后仍无可靠结果则淡出。实际响应取决于采样速度；停止或连接中断会清除灯色。</p></section>
+<section class="drawer-section score-details"><div class="drawer-section-head"><h3>模型此刻的判断</h3><span id="distributionNote">等待识别</span></div><p id="rawResult" role="status" aria-live="off">等待识别</p><div id="distribution" class="distribution" aria-label="各表情类别的模型分数"></div><p>这里显示每帧原始分数。主画面显示经过持续确认的灯光状态，两者可能暂时不同。</p></section>
+<section class="drawer-section model-details" id="modelDetails"><h3>选择识别模型</h3><label for="modelSelect">表情模型</label><select id="modelSelect"><option value="hse-b0">HSEmotion B0 · 默认推荐</option><option value="hse-b2">HSEmotion B2 · 对照选项</option><option value="official">SpacemiT ResNet50 · 原版</option></select><p id="modelStatus" role="status"></p><p id="modelDescription">正在读取模型信息。</p><p>停止体验后可以切换模型。</p></section>
+<section class="drawer-section"><h3>关于这束光</h3><p>灯色对应模型识别出的面部表情，不能反映真实心理状态。分类分数未经置信度校准。画面不保存，历史仅留在本次页面。</p><p>待机光仅供视觉引导。本 Demo 当前呈现屏幕灯效，尚未连接实体灯带。</p></section>
+</div></dialog>
+<script src="/light-controller.js"></script><script src="/app.js"></script><script src="/weather.js"></script></body></html>
