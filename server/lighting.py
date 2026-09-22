@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 import time
 import uuid
+from functools import lru_cache
 from group_mood import GroupMood, zone_pixels
 
 PALETTE = {
@@ -24,6 +25,22 @@ def rgb(hex_color):
     return [int(hex_color[i:i + 2], 16) for i in (1, 3, 5)]
 
 
+@lru_cache(maxsize=128)
+def current_scale(pixels, target_ma, led_ma, controller_bri, reserve_ma):
+    """Match WLED's estimated current after integer RGB quantization."""
+    def estimate(scale):
+        channels = sum(round(c * scale) for pixel in pixels for c in pixel)
+        return reserve_ma + channels * led_ma * controller_bri // (765 * 255)
+    lo, hi = 0., 1.
+    for _ in range(24):
+        mid = (lo + hi) / 2
+        if estimate(mid) < target_ma:
+            lo = mid
+        else:
+            hi = mid
+    return min((lo, hi), key=lambda s: (abs(estimate(s) - target_ma), s))
+
+
 def load_config(path):
     cfg = json.loads(Path(path).read_text(encoding='utf-8'))
     if type(cfg.get('enabled')) is not bool or not isinstance(cfg.get('port'), str) or not cfg['port']:
@@ -32,7 +49,8 @@ def load_config(path):
                         ('fps', 1, 60), ('keepalive_ms', 100, 1000)]:
         if type(cfg.get(key)) is not int or not lo <= cfg[key] <= hi:
             raise ValueError(f'灯带 {key} 必须为 {lo}～{hi} 的整数')
-    for key in ('brightness', 'standby_brightness'):
+    cfg.setdefault('mixed_brightness', cfg.get('brightness'))
+    for key in ('brightness', 'mixed_brightness', 'standby_brightness'):
         value = cfg.get(key)
         if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
             raise ValueError(f'灯带 {key} 必须在 0～1 之间')
@@ -40,11 +58,24 @@ def load_config(path):
     if not isinstance(color, str) or len(color) != 7 or not color.startswith('#'):
         raise ValueError('standby_color 必须为 #RRGGBB')
     rgb(color)
-    levels = cfg.get('group_brightness', [.78, .95])
+    levels = cfg.get('group_brightness', [.35, .60])
     if not isinstance(levels, list) or len(levels) != 2 or any(
             type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in levels):
         raise ValueError('group_brightness 必须为两个 0～1 的亮度值')
     cfg['group_brightness'] = levels
+    alignment = cfg.get('current_alignment')
+    if alignment is not None:
+        if not isinstance(alignment, dict):
+            raise ValueError('current_alignment 必须为对象')
+        for key, lo, hi in [('led_ma', 1, 254), ('controller_bri', 1, 255),
+                            ('reserve_ma', 0, 500), ('limit_ma', 1, 10000)]:
+            if type(alignment.get(key)) is not int or not lo <= alignment[key] <= hi:
+                raise ValueError(f'current_alignment.{key} 无效')
+        targets = alignment.get('targets_ma')
+        if (not isinstance(targets, list) or len(targets) != 3 or
+                any(type(t) is not int or not alignment['reserve_ma'] < t < alignment['limit_ma'] - cfg['led_count'] for t in targets)
+                or not targets[0] < targets[1] < targets[2]):
+            raise ValueError('targets_ma 必须为三个递增且低于限流预算的整数')
     if cfg.get('group_mode', 'spatial') not in ('spatial', 'cycle'):
         raise ValueError('group_mode 必须为 spatial 或 cycle')
     cfg.setdefault('group_mode', 'spatial')
@@ -194,6 +225,10 @@ class USBStrip:
                         raise ValueError(f"灯珠数量不一致：WLED={info['leds']['count']}，配置={self.cfg['led_count']}")
                     if info.get('live') or json.loads(line)['state'].get('lor', 0):
                         raise ValueError('WLED 正被其他实时源控制或已禁止实时接管')
+                    alignment = self.cfg.get('current_alignment')
+                    if alignment and (json.loads(line)['state']['bri'] != alignment['controller_bri']
+                                      or info['leds']['maxpwr'] != alignment['limit_ma']):
+                        raise ValueError('WLED 总亮度或限流与电流对齐配置不一致，请核对控制器设置')
                     self._write(adalight_frame((0, 0, 0), self.cfg['led_count']))
                     return {'version': info['ver'], 'led_count': info['leds']['count']}
             raise TimeoutError('WLED 未回应 USB 查询；请检查固件和串口占用')
@@ -278,8 +313,18 @@ class Lighting:
                 position -= duration
         target = target_pixels[0]
         power = self.cfg['brightness'] if p else self.cfg['standby_brightness']
+        if len(self.filter.composition) > 1:
+            power = self.cfg.get('mixed_brightness', self.cfg['brightness'])
         if self.filter.agreed and len(self.filter.people) >= 2:
             power = self.cfg['group_brightness'][0 if len(self.filter.people) < 4 else 1]
+        self.current_target_ma = None
+        alignment = self.cfg.get('current_alignment')
+        if alignment and p and len(self.filter.composition) == 1:
+            tier = (1 if len(self.filter.people) < 4 else 2) if self.filter.agreed and len(self.filter.people) >= 2 else 0
+            self.current_target_ma = alignment['targets_ma'][tier]
+            power = current_scale(tuple(tuple(pixel) for pixel in target_pixels),
+                                  self.current_target_ma, alignment['led_ma'],
+                                  alignment['controller_bri'], alignment['reserve_ma'])
         self._interpolate(now)
         if target_pixels != self.target_pixels or power != self.target_power:
             self.from_color, self.from_power = self.color[:], self.power
@@ -366,6 +411,7 @@ class Lighting:
                 'pixels': [[round(c) for c in p] for p in self.pixels],
                 'mode': 'emotion' if self.filter.current else 'standby', 'reason': self.reason,
                 'rgb': [round(c) for c in self.color], 'power': round(self.power, 4),
+                'current_target_ma': self.current_target_ma,
                 'transition': {'from': self.from_color, 'to': self.target_color,
                     'from_pixels': self.from_pixels, 'to_pixels': self.target_pixels,
                     'from_power': self.from_power, 'to_power': self.target_power,
