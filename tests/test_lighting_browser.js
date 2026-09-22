@@ -22,14 +22,15 @@ async function main(){
  await owner.screenshot(path.join(output('lighting'),'owner-neutral.png'));
  await observer.screenshot(path.join(output('lighting'),'observer-neutral.png'));
  await owner.ev("testFrames.idx=4;testFrames.lastSwitch=performance.now()+60000");
- assert(await owner.until("S.lastCount===3&&LAMP.snapshot.mode==='standby'"));
- assert(await observer.until("LAMP.snapshot.mode==='standby'"));
+ assert(await owner.until("S.lastCount===3&&LAMP.snapshot.group.people.length===3"));
+ assert(await observer.until("LAMP.snapshot.group.people.length===3"));
+ assert(await owner.ev('S.lastFaces.every(f=>f.emotion?.distribution.length===8)'));
  await sleep(500);
  assert.equal(await owner.ev('LAMP.snapshot.device.status'),'connected');
- await owner.screenshot(path.join(output('lighting'),'multi-standby.png'));
+ await owner.screenshot(path.join(output('lighting'),'multi-group.png'));
  await owner.ev("$('btnMain').click();lightSessionQueue");
  assert(await observer.until('LAMP.snapshot.owner===null'));
  assert.equal(owner.errors.length+observer.errors.length,0);
- console.log('PASS shared backend color, observer reload, ownership conflict, multi-person standby, USB connected, stop release');
+ console.log('PASS shared backend color, observer reload, ownership conflict, multi-person light, USB connected, stop release');
 }
 main().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{await owner?.close();await observer?.close()});

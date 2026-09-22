@@ -72,11 +72,11 @@ async function main(){
  check('probabilities normalize',Math.abs(result.p.distribution.reduce((s,x)=>s+x.score,0)-1)<.00001,result);
  await shot('recognizing-1440x900');
  await ev("testFrames.idx=4;testFrames.lastSwitch=performance.now()+60000");
- check('multiple faces detected',await until("S.lastCount===3 && $('stageStatusText').textContent.includes('多人入镜')"));
- check('multiple faces expire the lamp',await until("S.lastCount===3 && !LAMP.current && document.body.dataset.mood==='none'",5000));
- check('multiple faces have no raw classification',await ev('S.lastPrimary===null'));
- const history=await ev('S.timeline.length');await sleep(900);
- check('multiple faces add no emotion history',await ev('S.timeline.length')===history);
+ check('multiple faces detected',await until("S.lastCount===3 && $('stageStatusText').textContent.includes('3 人入镜')"));
+ check('multiple faces tracked independently',await until("S.lastCount===3 && LAMP.snapshot.group.people.length===3",5000));
+ check('multiple faces have per-person classification',await ev('S.lastPrimary===null && S.lastFaces.every(f=>f.emotion)'));
+ await sleep(1500);const history=await ev('S.timeline.length');await sleep(900);
+ check('unchanged group does not flood history',await ev('S.timeline.length')===history);
  await ev("testFrames.idx=0;testFrames.lastSwitch=performance.now()+60000");
  check('no face state',await until("S.lastCount===0 && !LAMP.current"));
  await ev("testFrames.idx=1;testFrames.lastSwitch=performance.now()+60000");

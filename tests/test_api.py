@@ -31,7 +31,9 @@ for name,count in [('none.jpg',0),('single.jpg',1),('multi.jpg',3)]:
         check('8 real classes normalized',len(dist)==8 and abs(sum(x['score'] for x in dist)-1)<1e-5)
         check('highest class matches primary',max(dist,key=lambda x:x['score'])['label']==p['label'])
         check('bbox stays within input',0<=p['box'][0]<p['box'][2]<=j['frame']['w'] and 0<=p['box'][1]<p['box'][3]<=j['frame']['h'])
-    else:check(name+' no false classification',j['primary'] is None)
+    else:check(name+' primary reserved for single face',j['primary'] is None)
+    if count>1:
+        check('every face classified',all(f.get('emotion',{}).get('distribution') for f in j['faces']))
 status,j=request('/api/infer',b'not an image')
 if status==409:
     for _ in range(20):

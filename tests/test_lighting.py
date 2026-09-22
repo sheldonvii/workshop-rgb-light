@@ -200,7 +200,7 @@ class WorkerTests(unittest.TestCase):
             self.assertGreaterEqual(len(connects), 2)
             self.assertGreaterEqual(len(sent), 3)
             self.assertEqual(light.snapshot()['device']['status'], 'connected')
-            self.assertEqual(sent[-1][1], (0, 54, 42))
+            self.assertEqual(sent[-1][1], ((0, 54, 42),) * cfg['led_count'])
             self.assertEqual(sent[-1][1], sent[-2][1])
         finally:
             light.close()

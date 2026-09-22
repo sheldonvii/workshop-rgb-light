@@ -190,10 +190,9 @@ class ModelBundle:
                 "score": round(float(d.score), 4),
             })
 
-        primary = None
-        if len(faces) == 1:
-            # 单人：按原图坐标裁剪（引擎已把框还原到原图坐标系），紧裁剪与官方示例一致
-            d = max(dets, key=lambda r: float(r.score))
+        for d, face in zip(dets, faces):
+            primary = None
+            # Classify each original-coordinate crop; retain the single-face API.
             x1, y1 = max(0, int(d.x1)), max(0, int(d.y1))
             x2, y2 = min(w, int(d.x2)), min(h, int(d.y2))
             if x2 - x1 >= 8 and y2 - y1 >= 8:
@@ -220,6 +219,8 @@ class ModelBundle:
                         "box": [round(float(d.x1), 1), round(float(d.y1), 1),
                                 round(float(d.x2), 1), round(float(d.y2), 1)],
                     }
+            face['emotion'] = primary
+        primary = faces[0]['emotion'] if len(faces) == 1 else None
         t_emo = time.perf_counter()
 
         return {
@@ -333,6 +334,18 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"ok": False, "error": {"code": "not_found", "message": "资源不存在"}})
 
     def do_POST(self) -> None:  # noqa: N802
+        if self.path == '/api/light/layout':
+            try:
+                n = int(self.headers.get('Content-Length', '0'))
+                if not 0 < n <= 512:
+                    raise ValueError('灯光模式参数过长或为空')
+                data = json.loads(self.rfile.read(n))
+                accepted = LIGHT.layout(data['mode'], data.get('run_id'))
+                self._send_json(200 if accepted else 409, {'ok': accepted, 'light': LIGHT.snapshot(),
+                    **({} if accepted else {'error': {'code': 'light_busy', 'message': '另一页面正在体验，请在该页面切换灯光模式'}})})
+            except (ValueError, KeyError, TypeError) as exc:
+                self._send_json(400, {'ok': False, 'error': {'code': 'bad_request', 'message': str(exc)}})
+            return
         if self.path == '/api/light/session':
             try:
                 n = int(self.headers.get('Content-Length', '0'))
@@ -377,6 +390,7 @@ class Handler(BaseHTTPRequestHandler):
         ticket = LIGHT.ticket(run_id, seq)
         jpeg = self.rfile.read(length)
         status, payload = MODELS.infer_locked(jpeg)
+        payload['mirror'] = self.headers.get('X-Mirror', 'true') != 'false'
         payload['light'] = LIGHT.accept(ticket, payload) if status == 200 else LIGHT.snapshot()
         # 运行标识与帧序号原样回显，页面端据此丢弃过期/跨运行结果
         payload["run_id"] = self.headers.get("X-Run-Id", "")

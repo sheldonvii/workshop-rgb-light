@@ -14,7 +14,7 @@ Python 3.14 对应的 OpenCV wheel 必须包含 `cv2/config-3.14.py`。安装只
 
 ## 数据链路与模型
 
-摄像头提交 JPEG → YOLOv5-Face 检测 → 单人脸原图裁剪 → 表情分类 → 原始分数展示 → 稳定灯效输出。
+摄像头提交 JPEG → YOLOv5-Face 检测 → 每张人脸原图裁剪 → 逐人分类与确认 → 汇总占比 → 分区渐变输出。
 
 | 模块 | 当前行为 |
 | --- | --- |
@@ -25,7 +25,7 @@ Python 3.14 对应的 OpenCV wheel 必须包含 `cv2/config-3.14.py`。安装只
 
 B0/B2 标签顺序为 angry、contempt、disgust、fear、happy、neutral、sad、surprise。输出经 softmax 转成分数；最高分低于 0.45，或前两名差值低于 0.12 时标为不确定。softmax 分数不是经过校准的真实心理概率。官方模型标签顺序见 `configs/emotion.txt`，原始分数为 logit，不能当百分比。
 
-只在检测到一张脸时进行分类。无人或多人时 `primary=null`；多人画面显示所有红色人脸框并提示调整位置。没有主角选择、人脸身份跟踪或多人情绪融合。
+所有检测到的人脸依次分类，不设三人上限。每个 `faces[]` 包含 `emotion`；`primary` 保留单人兼容格式，无人或多人时仍为 null。有效控制会话为脸分配短期 `track_id`，依据归一化中心距离和面积匹配，容忍检测列表重排与小幅移动。编号不代表身份，遮挡、交叉和快速移动可能重建或误配编号，不用于身份识别。
 
 ## 灯效与页面
 
@@ -35,16 +35,17 @@ B0/B2 标签顺序为 angry、contempt、disgust、fear、happy、neutral、sad�
 | --- | --- |
 | 提交节奏 | 约 350 毫秒；同一时间最多一个推理请求，忙时跳帧 |
 | 连续确认 | 同一可靠类别连续至少 300 毫秒，至少两个结果 |
-| 重复确认 | 或最近 1.2 秒内同一可靠类别出现至少三次，占全部单人结果至少 75% |
+| 重复确认 | 或每张脸最近 1.2 秒内同一可靠类别出现至少三次，占该脸全部结果至少 75% |
 | 换色间隔 | 两次颜色输出至少相隔 600 毫秒，两条确认通路均遵守 |
 | 过渡 | 后端生成 400 毫秒渐变，USB 最多 30 帧/秒，网页显示同一轨迹 |
-| 不可靠结果 | 不确定、无人或多人持续 900 毫秒后渐变回低亮度待机光 |
+| 不可靠结果 | 每张脸独立保留旧色 900 毫秒，失效者退出占比；全部失效后回待机 |
+| 亮度 | 单人或不同表情 60%；2～3 人全员一致 78%；4 人及以上一致 95% |
 
-单帧不能确认；重复、乱序输入不计票。无人、多人以及超过 1 秒的采样间断会清除候选证据。完全没有新结果时，从最后采样后的 1 秒开始计入 900 毫秒宽限；后端独立线程定时检查。停止、切到后台、摄像头结束后清除情绪证据并渐变回待机。
+单帧不能确认；重复、乱序输入不计票。某张脸不再出现或超过 1 秒的采样间断会清除其候选证据。完全没有新结果时，从最后采样后的 1 秒开始计入 900 毫秒宽限；后端独立线程定时检查。停止、切到后台、摄像头结束后清除全部轨迹和情绪证据并渐变回待机。
 
-如果短暂多人后恢复单人且类别与保留灯色相同，可恢复该灯色；不同类别仍需确认。历史记录表示灯色保持区间，包含短暂保持旧色的时间，不等于逐帧情绪事实。侧栏始终区分原始判断与稳定灯效。
+多人一致增亮要求每个人当前可见且稳定，同色但有人待确认不增亮。不同表情可选择按画面左右分区，或整灯按情绪轮换。整灯模式每种情绪停留人数 × 1.2 秒、最多 2.4 秒，含 400 毫秒渐变；轮换不重置逐人确认，也不改变网页占比背景。沿线颜色占比和背景按确认人数汇总，各人按钮和人脸框可打开对应模型分数。未确认者单独提示，不计入颜色占比。历史按确认的情绪人数构成去重，记录保持区间，不记录过渡动画帧；相同构成交换位置不增加历史。
 
-300 毫秒是确认门槛，端到端响应还受采样和推理耗时影响。后端 `server/lighting.py` 负责稳定判定、会话、渐变和 USB 输出。网页只同步状态，不再决定灯色。串口权限、接线和配置见 [控制器说明](controller.md)。
+300 毫秒是确认门槛，端到端响应还受采样和推理耗时影响。`server/group_mood.py` 管理短期轨迹、逐人滤波和群体状态，`server/lighting.py` 管理会话、逐像素渐变和 USB 输出。网页只同步状态。串口权限、接线和配置见 [控制器说明](controller.md)。
 
 ## 接口
 
@@ -52,8 +53,9 @@ B0/B2 标签顺序为 angry、contempt、disgust、fear、happy、neutral、sad�
 | --- | --- |
 | `GET /api/health` | 服务状态、执行引擎、当前模型、可用模型、标签及加载时间 |
 | `POST /api/model` | JSON `{ "model": "hse-b0" }`；可选 `hse-b0`、`hse-b2`、`official` |
-| `POST /api/infer` | 请求体为 JPEG，最多 8 MiB；`X-Run-Id` 和 `X-Seq` 原样回显 |
-| `GET /api/light` | 后端当前情绪、渐变轨迹、会话归属和设备连接状态 |
+| `POST /api/infer` | 请求体为 JPEG，最多 8 MiB；`X-Run-Id` 和 `X-Seq` 原样回显；`X-Mirror: false` 使用非镜像灯区顺序 |
+| `GET /api/light` | 后端当前情绪、group 人员与占比、pixels 与逐像素渐变轨迹、会话归属和设备状态 |
+| `POST /api/light/layout` | `{ "mode": "cycle" 或 "spatial", "run_id": "当前会话" }`；无体验时可切换，有体验时仅控制者可切换；不改写配置文件 |
 | `POST /api/light/session` | `action` 为 start/stop/pause/resume，`run_id` 为会话标识；冲突返回 409 |
 | `GET /` | 静态页面，仅允许访问 `web/` 内的文件 |
 
@@ -75,6 +77,9 @@ USB 使用 Python 标准库，不增加 pyserial 依赖。串口查询使用 JSO
 .venv/bin/python scripts/smoke_vision.py
 .venv/bin/python tests/test_api.py
 .venv/bin/python tests/test_lighting.py
+.venv/bin/python tests/test_group_mood.py
+.venv/bin/python tests/test_multi_face.py
+node tests/test_multi_face_browser.js
 node tests/test_lighting_browser.js
 node tests/test_ui.js
 node tests/test_browser_contract.js
@@ -85,7 +90,10 @@ node tests/test_camera.js
 | 入口 | 职责 |
 | --- | --- |
 | `tests/test_lighting.py` | 连续／重复确认、噪声、宽限、会话、迟到结果、渐变连续性、串口断开与重连 |
-| `tests/test_lighting_browser.js` | 已连接实体控制器时验证双页面同步、控制权冲突、多人待机和停止释放 |
+| `tests/test_lighting_browser.js` | 已连接实体控制器时验证双页面同步、控制权冲突、多人逐脸结果和停止释放 |
+| `tests/test_group_mood.py` | 多人人数档位、混合占比、镜像、轨迹匹配、逐人宽限及像素协议 |
+| `tests/test_multi_face.py` | 同一测试人像组成 3／6 人图，真实推理与增亮；生成明确标注的混合情绪界面 fixture |
+| `tests/test_multi_face_browser.js` | 真实三人页面、灯光模式切换、混合配色与个人分数；先运行上一项生成 fixture |
 | `tests/test_api.py` | 无人／单人／多人、八类分数、原图坐标、错误请求和路径限制 |
 | `tests/test_ui.js` | 四种视口、侧栏焦点、明暗配色、低动效、真实测试帧及合成 UI 状态 |
 | `tests/test_browser_contract.js` | 三模型切换、人数状态、镜像、不确定、停止和权限拒绝 |

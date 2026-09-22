@@ -10,6 +10,7 @@ from pathlib import Path
 import threading
 import time
 import uuid
+from group_mood import GroupMood, zone_pixels
 
 PALETTE = {
     'happy': '#FFD000', 'surprise': '#FF780A', 'neutral': '#00D9A6',
@@ -39,6 +40,14 @@ def load_config(path):
     if not isinstance(color, str) or len(color) != 7 or not color.startswith('#'):
         raise ValueError('standby_color 必须为 #RRGGBB')
     rgb(color)
+    levels = cfg.get('group_brightness', [.78, .95])
+    if not isinstance(levels, list) or len(levels) != 2 or any(
+            type(v) not in (int, float) or not math.isfinite(v) or not 0 <= v <= 1 for v in levels):
+        raise ValueError('group_brightness 必须为两个 0～1 的亮度值')
+    cfg['group_brightness'] = levels
+    if cfg.get('group_mode', 'spatial') not in ('spatial', 'cycle'):
+        raise ValueError('group_mode 必须为 spatial 或 cycle')
+    cfg.setdefault('group_mode', 'spatial')
     return cfg
 
 
@@ -117,9 +126,12 @@ class MoodFilter:
 
 
 def adalight_frame(color, count):
+    pixels = [color] * count if len(color) == 3 and isinstance(color[0], (int, float)) else color
+    if len(pixels) != count or not 1 <= count <= 1000:
+        raise ValueError('Invalid pixel count')
     size = count - 1
     hi, lo = size >> 8, size & 255
-    return b'Ada' + bytes((hi, lo, hi ^ lo ^ 0x55)) + bytes(color) * count
+    return b'Ada' + bytes((hi, lo, hi ^ lo ^ 0x55)) + b''.join(bytes(p) for p in pixels)
 
 
 class USBStrip:
@@ -216,7 +228,7 @@ class Lighting:
     def __init__(self, cfg, clock=time.monotonic, transport_factory=USBStrip):
         self.cfg, self.clock, self.transport_factory = cfg, clock, transport_factory
         self.lock = threading.RLock()
-        self.filter = MoodFilter()
+        self.filter = GroupMood(MoodFilter)
         self.instance = uuid.uuid4().hex
         self.owner = None
         self.epoch = 0
@@ -227,9 +239,15 @@ class Lighting:
         self.color = rgb(cfg['standby_color'])
         self.power = cfg['standby_brightness']
         self.from_color, self.target_color = self.color[:], self.color[:]
+        self.pixels = [self.color[:] for _ in range(cfg['led_count'])]
+        self.from_pixels = copy.deepcopy(self.pixels)
+        self.target_pixels = copy.deepcopy(self.pixels)
         self.from_power = self.target_power = self.power
         self.transition_at = clock()
         self.revision = 0
+        self.cycle_key = None
+        self.cycle_at = clock()
+        self.output_label = None
         self.device = {'status': 'connecting' if cfg['enabled'] else 'disabled', 'message': '', 'port': cfg['port']}
         self.stop_event = threading.Event()
         self.thread = None
@@ -242,11 +260,30 @@ class Lighting:
             self.reason = 'session_expired'
         self.filter.tick(now)
         p = self.filter.current
-        target = rgb(PALETTE[p['label']]) if p else rgb(self.cfg['standby_color'])
+        target_pixels = zone_pixels(self.filter.people, {k: rgb(v) for k,v in PALETTE.items()},
+                                   self.cfg['led_count'], rgb(self.cfg['standby_color']))
+        cycle_key = (self.filter.key, self.cfg['group_mode'])
+        if cycle_key != self.cycle_key:
+            self.cycle_key, self.cycle_at = cycle_key, now
+        self.output_label = p['label'] if p else None
+        if self.cfg['group_mode'] == 'cycle' and len(self.filter.composition) > 1:
+            colors = sorted(self.filter.composition, key=lambda c: c['label'])
+            durations = [min(2.4, 1.2*c['count']) for c in colors]
+            position = (now-self.cycle_at) % sum(durations)
+            for color, duration in zip(colors, durations):
+                if position < duration:
+                    self.output_label = color['label']
+                    target_pixels = [rgb(PALETTE[color['label']]) for _ in range(self.cfg['led_count'])]
+                    break
+                position -= duration
+        target = target_pixels[0]
         power = self.cfg['brightness'] if p else self.cfg['standby_brightness']
+        if self.filter.agreed and len(self.filter.people) >= 2:
+            power = self.cfg['group_brightness'][0 if len(self.filter.people) < 4 else 1]
         self._interpolate(now)
-        if target != self.target_color or power != self.target_power:
+        if target_pixels != self.target_pixels or power != self.target_power:
             self.from_color, self.from_power = self.color[:], self.power
+            self.from_pixels, self.target_pixels = copy.deepcopy(self.pixels), target_pixels
             self.target_color, self.target_power = target, power
             self.transition_at = now
             self.revision += 1
@@ -255,6 +292,8 @@ class Lighting:
         t = min(1, max(0, (now - self.transition_at) * 1000 / self.cfg['transition_ms']))
         ease = t * t * (3 - 2 * t)
         self.color = [a + (b - a) * ease for a, b in zip(self.from_color, self.target_color)]
+        self.pixels = [[a + (b-a)*ease for a,b in zip(start, end)]
+                       for start,end in zip(self.from_pixels, self.target_pixels)]
         self.power = self.from_power + (self.target_power - self.from_power) * ease
 
     def session(self, action, run_id):
@@ -290,6 +329,17 @@ class Lighting:
                 return None
             return (run_id, self.epoch, seq, self.clock())
 
+    def layout(self, mode, run_id):
+        if mode not in ('spatial', 'cycle'):
+            raise ValueError('灯光模式无效')
+        with self.lock:
+            self._advance(self.clock())
+            if self.owner and self.owner != run_id:
+                return False
+            self.cfg['group_mode'] = mode
+            self._advance(self.clock())
+            return True
+
     def accept(self, ticket, result):
         with self.lock:
             now = self.clock()
@@ -298,7 +348,7 @@ class Lighting:
                 owner, epoch, seq, started = ticket
                 if owner == self.owner and epoch == self.epoch and not self.paused and seq > self.last_seq and now - started <= 1.5:
                     self.last_seq = seq
-                    self.filter.accept(result.get('primary'), result['count'], now)
+                    self.filter.accept(result, now)
                     self.reason = 'multiple' if result['count'] > 1 else 'no_face' if result['count'] == 0 else 'uncertain' if not result.get('primary') or result['primary'].get('uncertain') else 'recognizing'
             return self.snapshot()
 
@@ -311,9 +361,13 @@ class Lighting:
                 'sample_ms': now * 1000,
                 'owner': self.owner, 'paused': self.paused,
                 'current': self.filter.current, 'status': self.filter.status,
+                'group': self.filter.snapshot(),
+                'group_mode': self.cfg['group_mode'], 'output_label': self.output_label,
+                'pixels': [[round(c) for c in p] for p in self.pixels],
                 'mode': 'emotion' if self.filter.current else 'standby', 'reason': self.reason,
                 'rgb': [round(c) for c in self.color], 'power': round(self.power, 4),
                 'transition': {'from': self.from_color, 'to': self.target_color,
+                    'from_pixels': self.from_pixels, 'to_pixels': self.target_pixels,
                     'from_power': self.from_power, 'to_power': self.target_power,
                     'elapsed_ms': max(0, (now - self.transition_at) * 1000), 'duration_ms': self.cfg['transition_ms']},
                 'device': self.device,
@@ -342,12 +396,12 @@ class Lighting:
                             log.info('USB WLED connected: %s', info)
                             previous = None
                             state = self.snapshot()
-                        color = tuple(round(c * state['power']) for c in state['rgb'])
+                        color = tuple(tuple(round(c * state['power']) for c in p) for p in state['pixels'])
                         if color != previous or start - last_sent >= self.cfg['keepalive_ms'] / 1000:
                             transport.send(color)
                             previous, last_sent = color, start
                             with self.lock:
-                                self.device.update(sent_rgb=list(color), last_write_ms=self.clock() * 1000)
+                                self.device.update(sent_rgb=list(color[0]), sent_pixels=color, last_write_ms=self.clock() * 1000)
                     except (OSError, ValueError, KeyError, TypeError, ImportError) as exc:
                         if transport:
                             transport.close()

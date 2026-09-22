@@ -12,7 +12,7 @@ $('themeToggle').addEventListener('click', () => {
   savedTheme = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
   document.documentElement.dataset.theme = savedTheme;
   try { localStorage.setItem('mood-studio-theme',savedTheme); } catch {}
-  drawWeather();
+  updateWeather();
 });
 const drawer=$('settingsDrawer');
 $('infoToggle').addEventListener('click',()=>{drawer.showModal();document.body.classList.add('drawer-open');$('infoToggle').setAttribute('aria-expanded','true');});
@@ -39,7 +39,8 @@ function createDistribution() {
   }));
 }
 function updateWeather() {
-  const raw=S.phase==='running'&&!S.stale?S.lastPrimary:null;
+  updateGroupView();
+  const raw=selectedRaw();
   const p=LAMP.current;
   const valid=!!p;
   $('clearHistory').disabled=!S.timeline.length;
@@ -51,20 +52,23 @@ function updateWeather() {
     row.classList.toggle('is-leading',!!v&&raw.label===v.label);
     row.querySelector('.dist-value').textContent=v?`${(v.score*100).toFixed(1)}%`:raw?'未提供':'待识别';
   }
-  $('rawResult').textContent=raw ? `${raw.uncertain?'不确定，较接近':'首选类别'}${raw.label_zh}${raw.score_type==='softmax'?` · ${(raw.score*100).toFixed(1)}%`:''}` : S.stale?'结果已失效':'等待单人入镜';
+  $('rawResult').textContent=raw ? `${raw.uncertain?'不确定，较接近':'首选类别'}${raw.label_zh}${raw.score_type==='softmax'?` · ${(raw.score*100).toFixed(1)}%`:''}` : S.stale?'结果已失效':'等待入镜';
   const name=valid?WEATHER_ICON[p.label]:S.phase==='idle'?'power':'scan-face';
   document.body.dataset.light=valid?'on':'standby';
   document.body.dataset.mood=p?.label||'none';
-  setLightTarget(valid?MOOD_COLOR[p.label]:'#eab7cf',valid?1:.24);
-  $('lightName').textContent=valid?LIGHT_NAME[p.label]:'待机光';
-  $('lightState').textContent=valid?(LAMP.status==='stable'?'情绪已确认 · 柔和换色':'保留上一灯色 · 继续观察'):S.stale?'结果暂未更新 · 已回到待机光':raw?.uncertain?'判断不确定 · 保持待机光':S.lastCount>1?'多人入镜 · 保持待机光':'待机光 · 等待稳定表情';
+  setLightTarget(valid?(MOOD_COLOR[p.label]||MOOD_COLOR[LAMP.snapshot?.group?.composition[0]?.label]||'#eab7cf'):'#eab7cf',valid?1:.24);
+  $('lightName').textContent=valid?(p.label==='mixed'?'各有颜色':LIGHT_NAME[p.label]):'待机光';
+  $('lightState').textContent=valid?(LAMP.snapshot?.group?.people.length>1?'从画面左侧到右侧 · 分区渐变':LAMP.status==='stable'?'情绪已确认 · 柔和换色':'保留上一灯色 · 继续观察'):S.stale?'结果暂未更新 · 已回到待机光':raw?.uncertain?'判断不确定 · 保持待机光':'待机光 · 等待稳定表情';
+  if(p?.label==='mixed'&&LAMP.snapshot?.group_mode==='cycle'){
+    $('lightState').textContent=`整灯轮换 · 正在呈现${LABEL_ZH[LAMP.snapshot.output_label]||''}`;
+  }
   const device=LAMP.snapshot?.device;
   $('lightConnection').dataset.status=device?.status||'connecting';
   $('lightConnection').textContent=device?.status==='connected'?`控制器已连接 · 配置 ${device.led_count} 颗灯珠`:device?.status==='disabled'?'屏幕预览 · 实体灯带未启用':device?.status==='disconnected'?'控制器未连接 · 正在重试':device?.status==='unavailable'?'灯光服务暂不可达':'正在连接控制器…';
   $('lightDeviceDetail').textContent=device?.message|| (device?.status==='connected'?`WLED ${device.version} · USB 在线；灯带接线和供电需现场确认`:'检查 USB 连接和 README 中的串口权限说明。');
-  for(const chip of $('colorLegend').children)chip.classList.toggle('active',!!valid&&chip.dataset.label===p.label);
+  for(const chip of $('colorLegend').children)chip.classList.toggle('active',!!valid&&(chip.dataset.label===p.label||LAMP.snapshot?.group?.composition.some(c=>c.label===chip.dataset.label)));
   const symbol=$('weatherSymbol');
-  if(symbol.dataset.icon!==name){symbol.dataset.icon=name;symbol.innerHTML=`<i data-lucide="${name}"></i>`;window.lucide?.createIcons();}
+  if(symbol.dataset.icon!==name){symbol.dataset.icon=name;symbol.innerHTML=`<i data-lucide="${name||'users'}"></i>`;window.lucide?.createIcons();}
   drawWeather();
 }
 // Interpolate the backend trajectory locally; polling never creates a new target.
@@ -87,6 +91,7 @@ function setLightTarget(hex,power){
     const t=duration?Math.min(1,(elapsed+now-start)/duration):1,e=t*t*(3-2*t);
     lightPaint.hex='#'+a.map((v,i)=>Math.round(v+(b[i]-v)*e).toString(16).padStart(2,'0')).join('');
     lightPaint.power=Math.min(1,startPower+(endPower-startPower)*e);
+    paintPixels(track,e,track?track.from_power+(track.to_power-track.from_power)*e:LAMP.snapshot?.power||.06);
     document.body.style.setProperty('--mood',lightPaint.hex);drawWeather();
     if(t<1)lightPaint.raf=requestAnimationFrame(frame);else lightPaint.raf=0;
   }
@@ -111,9 +116,19 @@ function drawWeather() {
   path.bezierCurveTo(w*.89,h*.71,w*.54,h*.77,w*.34,h*.83);
   path.bezierCurveTo(w*.14,h*.91,w*.44,h*1.02,w*.67,h*.91);
   const color=ctx.createLinearGradient(w*.08,h*.8,w*.91,h*.15);
-  color.addColorStop(0,hue);
-  color.addColorStop(.48,hue);
-  color.addColorStop(1,hue);
+  const composition=LAMP.snapshot?.group?.composition||[];
+  if(composition.length>1){
+    let offset=0;const total=composition.reduce((sum,c)=>sum+c.count,0);
+    for(const c of composition){
+      const start=offset;offset+=c.count/total;
+      color.addColorStop(Math.min(start+.025,offset),MOOD_COLOR[c.label]);
+      color.addColorStop(Math.max(start,offset-.025),MOOD_COLOR[c.label]);
+    }
+  }else{
+    color.addColorStop(0,hue);
+    color.addColorStop(.48,hue);
+    color.addColorStop(1,hue);
+  }
   const spread=ctx.createRadialGradient(w*.54,h*.54,0,w*.54,h*.54,w*.43);
   spread.addColorStop(0,hue+(lit?(dark?'22':'10'):'00'));spread.addColorStop(1,hue+'00');
   ctx.fillStyle=spread;ctx.fillRect(0,0,w,h);
@@ -122,7 +137,9 @@ function drawWeather() {
   const size=Math.max(7,Math.min(w*.024,15));ctx.lineCap='round';ctx.lineJoin='round';
   ctx.save();ctx.translate(0,5);ctx.strokeStyle=dark?'#100c1c80':'#6b547344';ctx.lineWidth=size+5;ctx.shadowBlur=10;ctx.shadowColor='#09071480';ctx.stroke(path);ctx.restore();
   ctx.strokeStyle=color;ctx.lineWidth=size;ctx.shadowColor=hue;ctx.shadowBlur=lit?25:0;ctx.globalAlpha=.32+.68*lightPaint.power;ctx.stroke(path);
-  if(lit){ctx.lineWidth=size*.72;ctx.shadowBlur=12;ctx.stroke(path);ctx.shadowBlur=0;ctx.strokeStyle=dark?'#fff2ea':'#fff9f2';ctx.lineWidth=size*.26;ctx.globalAlpha=.88*lightPaint.power;ctx.stroke(path);}
+  if(lit){ctx.lineWidth=size*.72;ctx.shadowBlur=12;ctx.stroke(path);}
+  if(composition.length>1){ctx.shadowBlur=0;ctx.lineWidth=size;paintGroupCurve(ctx,w,h,composition);}
+  if(lit){ctx.shadowBlur=0;ctx.strokeStyle=dark?'#fff2ea':'#fff9f2';ctx.lineWidth=size*.26;ctx.globalAlpha=.88*lightPaint.power;ctx.stroke(path);}
   ctx.globalAlpha=1;ctx.shadowBlur=0;
 }
 async function applyModelInfo(health) {

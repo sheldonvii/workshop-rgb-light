@@ -414,7 +414,7 @@ async function sendFrame(blob) {
   try {
     const r = await fetch("/api/infer", {
       method: "POST",
-      headers: { "Content-Type": "application/octet-stream", "X-Run-Id": runId, "X-Seq": String(seq) },
+      headers: { "Content-Type": "application/octet-stream", "X-Run-Id": runId, "X-Seq": String(seq), "X-Mirror": document.body.dataset.mirror !== 'false' ? 'true' : 'false' },
       body: blob,
       signal: ctl.signal,
     });
@@ -475,22 +475,25 @@ function onResult(j) {
   let pushed = false;
   if (stable) {
     const tail = S.timeline[S.timeline.length - 1];
-    if (tail && !S.historyGap && tail.runId === S.runId && tail.label === stable.label) {
+    const group=LAMP.snapshot?.group;
+    const key=group?.key||stable.label;
+    const description=group?.people.length>1?group.composition.map(c=>`${c.label_zh} ${c.count} 人`).join(' · '):stable.label_zh;
+    if (tail && !S.historyGap && tail.runId === S.runId && tail.key === key) {
       tail.t1 = now; tail.score = stable.score;
     } else {
-      S.timeline.push({label:stable.label, zh:stable.label_zh, mood:stable.label,
+      S.timeline.push({key,label:stable.label, zh:description, mood:stable.label,
         score:stable.score,t0:now,t1:now,runId:S.runId,scoreType:stable.score_type});
       if (S.timeline.length > CFG.timelineKeepMax) S.timeline.shift();
       pushed = true;
     }
     S.historyGap = false;
-    renderComment(LAMP.status === 'stable' ? changeComment(prevLabel, stable) : '保留上一种灯色，等待下一次稳定确认。');
+    renderComment(group?.people.length>1 ? `${description}。${group.agreed?'表情一致，灯光一起变亮。':'每个人保留自己的颜色。'}` : LAMP.status === 'stable' ? changeComment(prevLabel, stable) : '保留上一种灯色，等待下一次稳定确认。');
   } else {
     S.historyGap = true;
     renderComment(stable ? '保留上一种灯色，等待下一次稳定确认。' : j.primary?.uncertain
       ? '几个表情分数接近，正在继续观察。' : j.count === 0
       ? '看向镜头，灯光会在表情稳定后亮起。' : j.count > 1
-      ? '请保持单人入镜。' : '正在确认表情，保持自然就好。');
+      ? '正在分别确认每个人的表情。' : '正在确认表情，保持自然就好。');
   }
 
   if (S.stale) { S.stale = false; }
@@ -553,7 +556,7 @@ function updateStageStatus() {
   } else {
     el.dataset.s = "multi";
     els.stageStatusIcon.innerHTML = icon("users", 16);
-    els.stageStatusText.textContent = `多人入镜（${S.lastCount} 张脸）· 请调整位置`;
+    els.stageStatusText.textContent = `${S.lastCount} 人入镜 · 分别识别中`;
   }
 }
 
@@ -572,20 +575,27 @@ function renderCurrent() {
     return;
   }
   if (!p) {
-    setCurrentLabel(S.lastPrimary?.uncertain ? "观察中" : S.lastCount === 1 ? "确认中" : "等你入镜");
+    setCurrentLabel(S.lastPrimary?.uncertain ? "观察中" : S.lastCount > 0 ? "确认中" : "等你入镜");
     els.currentLabel.dataset.on = "false";
     els.currentEn.textContent = "";
     els.currentScore.textContent = "";
     els.currentTime.textContent = "";
-    els.currentNote.textContent = S.stale ? '结果已失效，等待恢复' : S.lastCount === 0 ? "等待入镜" : S.lastCount === 1 ? "持续确认后点亮" : "多人入镜时不做识别";
+    els.currentNote.textContent = S.stale ? '结果已失效，等待恢复' : S.lastCount === 0 ? "等待入镜" : "逐人确认后点亮";
     return;
   }
   setCurrentLabel(p.uncertain ? '不确定' : p.label_zh);
   els.currentLabel.dataset.on = String(!!on);
   els.currentEn.textContent = p.uncertain ? `较接近${p.label_zh}` : p.label;
   els.currentScore.textContent = LAMP.status !== "stable" ? "上一稳定结果" : p.score_type === 'softmax' ? `模型分数 ${(p.score * 100).toFixed(1)}%` : `原始分数 ${p.score}`;
+  const group=LAMP.snapshot?.group;
+  if(group?.people.length>1){
+    els.currentEn.textContent=group.agreed?`${group.confirmed_count} 人一致`:`${group.confirmed_count} 人已确认`;
+    els.currentScore.textContent=group.composition.map(c=>`${c.label_zh} ${c.count}`).join(' · ');
+    els.currentNote.textContent=group.agreed?'共同点亮':group.people.some(p=>p.status!=='stable'||!p.visible)?'部分表情待确认':'各有颜色';
+  }
   els.currentTime.textContent = new Date(S.lastOkTs).toLocaleTimeString("zh-CN", { hour12: false });
   els.currentNote.textContent = S.stale ? "结果失效" : LAMP.status !== "stable" ? "保持灯色" : "已稳定确认";
+  if(group?.people.length>1&&!S.stale)els.currentNote.textContent=group.agreed?'共同点亮':LAMP.status!=='stable'?'部分表情待确认':'各有颜色';
 }
 
 function renderComment(text) {
@@ -652,10 +662,12 @@ function drawOverlay(faces, primary) {
     const displayX = document.body.dataset.mirror === 'false' ? f.x1 : fw - f.x2;
     const isPrimary = primary && primary.box &&
       Math.abs(primary.box[0] - f.x1) < 1 && Math.abs(primary.box[1] - f.y1) < 1;
-    ctx.strokeStyle = multi ? "#E5534B" : "#E8B34B";
+    const person=LAMP.snapshot?.group?.people.find(p=>p.id===f.track_id);
+    const emotion=person?.current || f.emotion || (isPrimary?primary:null);
+    ctx.strokeStyle = emotion && !emotion.uncertain ? MOOD_COLOR[emotion.label] : '#C3B6CE';
     ctx.strokeRect(displayX, f.y1, w, h);
-    if (!multi && isPrimary && primary) {
-      const text = primary.uncertain ? '不确定' : primary.label_zh;
+    if (emotion || person) {
+      const text = `${person?'P'+person.id+' · ':''}${emotion?.uncertain?'观察中':emotion?.label_zh||'确认中'}${person?.status==='holding'?' · 保留':''}`;
       ctx.font = `600 ${Math.max(14, c.width / 46)}px "Noto Sans CJK SC", sans-serif`;
       const tw = ctx.measureText(text).width;
       const pad = Math.max(6, c.width / 160);
@@ -663,7 +675,7 @@ function drawOverlay(faces, primary) {
       const bx = Math.max(0, Math.min(displayX, fw - tw - pad*2)), by = Math.max(0, f.y1 - bh - 4);
       ctx.fillStyle = "rgba(13,18,24,0.82)";
       ctx.fillRect(bx, by, tw + pad * 2, bh);
-      ctx.fillStyle = "#E8B34B";
+      ctx.fillStyle = ctx.strokeStyle;
       ctx.textBaseline = "middle";
       ctx.fillText(text, bx + pad, by + bh / 2 + 1);
     }
