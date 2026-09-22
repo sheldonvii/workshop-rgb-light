@@ -39,7 +39,7 @@ B0/B2 标签顺序为 angry、contempt、disgust、fear、happy、neutral、sad�
 | 换色间隔 | 两次颜色输出至少相隔 600 毫秒，两条确认通路均遵守 |
 | 过渡 | 后端生成 400 毫秒渐变，USB 最多 30 帧/秒，网页显示同一轨迹 |
 | 不可靠结果 | 每张脸独立保留旧色 900 毫秒，失效者退出占比；全部失效后回待机 |
-| 亮度 | 单人或不同表情 60%；2～3 人全员一致 78%；4 人及以上一致 95% |
+| 亮度 | 单一确认情绪按估算电流对齐：单人 220mA；2～3 人全员一致 450mA；4 人及以上一致 700mA；不同表情仍为 60% |
 
 单帧不能确认；重复、乱序输入不计票。某张脸不再出现或超过 1 秒的采样间断会清除其候选证据。完全没有新结果时，从最后采样后的 1 秒开始计入 900 毫秒宽限；后端独立线程定时检查。停止、切到后台、摄像头结束后清除全部轨迹和情绪证据并渐变回待机。
 
@@ -69,64 +69,40 @@ USB 使用 Python 标准库，不增加 pyserial 依赖。串口查询使用 JSO
 
 ## 测试与复现
 
-测试前关闭其他体验页面，确保 B0 已就绪。测试按顺序运行，避免相互切换模型、争用摄像头或使服务进入 busy。
-
-基础验证命令如下。`test_lighting_browser.js` 要求实体灯带已连接，`test_camera.js` 要求真实 USB 摄像头；其他测试可在关闭实体输出时运行。浏览器测试使用 Node.js 22+ 和系统 Chromium，无 npm 依赖。
+统一入口为 `./run_test.sh`。测试前在其他网页停止体验，避免摄像头、模型切换和灯光控制权冲突。完整检查需要当前 Python 环境、四个模型文件、Node.js 22+、系统 Chromium、真实 USB 摄像头及控制器；无 npm 依赖，不自动下载模型或安装软件，不需要 sudo。
 
 ```bash
-.venv/bin/python scripts/smoke_vision.py
-.venv/bin/python tests/test_api.py
-.venv/bin/python tests/test_lighting.py
-.venv/bin/python tests/test_group_mood.py
-.venv/bin/python tests/test_multi_face.py
-node tests/test_multi_face_browser.js
-node tests/test_lighting_browser.js
-node tests/test_ui.js
-node tests/test_browser_contract.js
-node tests/test_browser_contract.js --lifecycle
-node tests/test_camera.js
+./run_test.sh                     # 全套自动检查，含摄像头和 USB 控制器
+./run_test.sh --unit              # 离线灯光规则检查，不访问硬件或启动服务
+./run_test.sh --no-hardware       # 明确跳过摄像头和控制器检查
+./run_test.sh --soak 1800         # 全套检查后增加 30 分钟摄像头压力测试
 ```
 
-| 入口 | 职责 |
+`--no-hardware --soak 15` 可短程验证图片推理压力，不代表通过长期验收，也不验证摄像头。`--no-hardware` 跳过硬件要求，不能关闭已有服务的实体输出；若控制器在线，图片推理测试仍可能改变灯色。需要完全关闭输出时，按控制器文档设置 `enabled=false` 并重启服务。
+
+调度器按依赖顺序串行运行。服务不存在时从当前项目临时启动，结束后只停止自己启动的服务；已有服务必须是当前项目的唯一进程，测试后恢复其模型和灯光模式。若其他网页正在体验，会报错并要求先停止，不抢占会话。不额外加载第二套 NPU 引擎。Ctrl-C 会保留已完成报告并清理本轮子进程。
+
+默认地址为 `http://127.0.0.1:8321`，`BAROMETER_URL` 可指定板端 localhost 的其他端口。`CHROMIUM` 指定浏览器可执行文件，默认 `/usr/lib/chromium/chromium`；`TEST_PYTHON` 指定 Python，可用于不同虚拟环境。完整检查应在 K3 本机执行，浏览器依赖板端设备和 `/proc`。
+
+| 测试文件 | 保留的职责 |
 | --- | --- |
-| `tests/test_lighting.py` | 连续／重复确认、噪声、宽限、会话、迟到结果、渐变连续性、串口断开与重连 |
-| `tests/test_lighting_browser.js` | 已连接实体控制器时验证双页面同步、控制权冲突、多人逐脸结果和停止释放 |
-| `tests/test_group_mood.py` | 多人人数档位、混合占比、镜像、轨迹匹配、逐人宽限及像素协议 |
-| `tests/test_multi_face.py` | 同一测试人像组成 3／6 人图，真实推理与增亮；生成明确标注的混合情绪界面 fixture |
-| `tests/test_multi_face_browser.js` | 真实三人页面、灯光模式切换、混合配色与个人分数；先运行上一项生成 fixture |
-| `tests/test_api.py` | 无人／单人／多人、八类分数、原图坐标、错误请求和路径限制 |
-| `tests/test_ui.js` | 四种视口、侧栏焦点、明暗配色、低动效、真实测试帧及合成 UI 状态 |
-| `tests/test_browser_contract.js` | 三模型切换、人数状态、镜像、不确定、停止和权限拒绝 |
-| `tests/test_camera.js` | 真实 USB 摄像头至少 1280×720、画面与推理更新、停止释放 |
-| `tests/test_soak.js` | 摄像头持续运行并发单人分类压力、RSS、视频帧／序号推进、资源释放 |
+| `tests/run_suite.py` | 依赖检查、服务管理、逐项超时、失败定位和报告汇总 |
+| `tests/test_lighting.py` | 单人滤波、会话、多人轨迹、电流对齐、混色、USB 断开重连；合并原三个单元测试 |
+| `tests/test_api.py` | 模型状态、无人/单人/多人、错误请求、3/6 人合成图片真实推理与电流档位；生成本轮页面 fixture |
+| `tests/test_ui.js` | 响应式布局、主题、侧栏、多人界面、个人分数、双页面同步和控制权；合并原三个页面入口 |
+| `tests/test_browser_contract.js` | 三模型切换、人数与不确定状态、镜像、权限拒绝；`--lifecycle` 验证迟到帧和请求故障恢复 |
+| `tests/test_camera.js` | 真实摄像头至少 1280×720、画面与推理推进、停止释放 |
+| `tests/test_soak.js` | 可选持续摄像头或图片推理压力、RSS 和资源释放 |
+| `tests/browser.js` | 浏览器 CDP 共用工具，负责临时配置目录和浏览器关闭 |
+| `tests/preview_pixels.py` | 手动灯珠寻址与渐变观察，不当作自动验收 |
 
-浏览器工具 `tests/browser.js` 使用 Node 22+ 自带 WebSocket；默认系统 Chromium 为 `/usr/lib/chromium/chromium`，可通过 `CHROMIUM` 指定。测试使用临时浏览器目录，结束时清理。`--use-fake-ui-for-media-stream` 仅自动允许权限，摄像头测试仍读取真实设备。
+运行结果写入 `tests/output/latest/`。`summary.txt` 汇总 PASS、FAIL、SKIP，`report.json` 包含各环节耗时、错误、排查提示和日志路径；对应阶段日志保留断言与堆栈，截图和子报告按职责存放。每次运行只清理这一生成目录，拒绝并发执行；不复用上次 fixture。退出码 0 表示本轮已执行检查通过，1 表示检查失败，2 表示入口参数或环境错误，130 表示中断。SKIP 只表示未执行，不代表通过。需要保留证据时，下一次运行前复制该目录。
 
-`BAROMETER_URL` 可指定测试服务地址。持续测试和重启测试需要本机 `/proc`，会按当前项目入口及端口定位唯一服务，拒绝匹配不到或匹配多个进程的情况。
+默认检查 USB 控制器通信、配置灯珠数，并通过 API 推理发送灯光状态；三线灯带没有发光反馈，软件通过不代表实际灯珠颜色或接线已验证。需要目视检查寻址时，先停止 Demo，再执行 `.venv/bin/python tests/preview_pixels.py --run`，最后重新 `./run.sh`。电流档位的纯逻辑验证已进入单元测试；控制器电流回读属于估算值，不能替代实测电流和现场观感。
 
-```bash
-# 模拟权限等待、迟到帧和请求失败；不停止真实服务
-node tests/test_browser_contract.js --lifecycle
-
-# 手动恢复验证：会停止并重新启动当前项目服务，结束后保持服务运行
-node tests/test_browser_contract.js --restart
-
-# 默认 30 分钟，包含摄像头及真实单人分类压力
-node tests/test_soak.js
-
-# 仅验证持续测试脚本的短程执行，不代表通过 30 分钟验收
-SOAK_SECONDS=15 node tests/test_soak.js
-
-# 无摄像头时用测试图片验证真实推理及压力循环，不验证摄像头硬件
-SOAK_SECONDS=15 node tests/test_soak.js --frames
-```
-
-重启测试启动的服务日志写入 `tests/output/runtime/server.log`。其他报告按测试职责写入 `tests/output/` 子目录。输出不进入 Git；仅保留 `docs/images/` 中当前页面的展示图。通过与否以本次命令退出码及本次报告为准，不沿用历史测试结论。
-
-`?frames=test` 显式启用隔离测试源，页面常驻提示测试图片；请求仍执行真实推理。三张共用输入位于 `web/test-frames/`。合成 UI fixture 仅验证颜色与布局，不证明模型准确率。项目没有带真人表情标注的准确率评测集。
-
+`?frames=test` 显式启用隔离图片源，页面常驻提示测试图片，请求仍执行真实推理。共用图片保留在 `web/test-frames/`，不能当中间产物删除。3/6 人测试使用同一人像的重复拼图，混合情绪 fixture 为合成 UI 输入，两者都不构成真人群体准确率评测。
 ## 故障处理
 
 模型缺失或校验失败时运行 `scripts/download_models.py --verify-only` 查看具体文件。加载失败先检查 `/api/health` 和服务终端输出，再核对 Python、Vision 与系统 OpenCV 版本。摄像头失败检查 USB 连接、设备占用和浏览器权限；外部 HTTP 地址通常不满足摄像头安全上下文，默认使用板端 localhost。
 
-出现 `tcm buffer acquire failed` 时，用 `spacemit-tcm-smi` 检查占用及进程归属。不要直接全局清理，其他应用可能共用 TCM。冒烟脚本通过运行中服务验证检测和分类，不额外加载第二套 NPU 引擎。
+出现 `tcm buffer acquire failed` 时，用 `spacemit-tcm-smi` 检查占用及进程归属。不要直接全局清理，其他应用可能共用 TCM。统一测试通过同一个服务验证检测和分类，不额外加载第二套 NPU 引擎。

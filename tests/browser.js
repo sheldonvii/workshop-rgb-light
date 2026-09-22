@@ -9,7 +9,7 @@ const CHROMIUM = process.env.CHROMIUM || '/usr/lib/chromium/chromium';
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 function output(suite) {
-  const folder = path.join(ROOT, 'tests/output', suite);
+  const folder = path.join(process.env.TEST_OUTPUT_DIR || path.join(ROOT,'tests/output/latest'), suite);
   fs.mkdirSync(folder, {recursive:true});
   return folder;
 }

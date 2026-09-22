@@ -1,5 +1,7 @@
 """Deterministic control tests and bounded worker recovery, without LEDs."""
+import copy
 import json
+import tempfile
 from pathlib import Path
 import sys
 import threading
@@ -8,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'server'))
-from lighting import Lighting, MoodFilter, USBStrip, adalight_frame, load_config
+from lighting import Lighting, MoodFilter, USBStrip, PALETTE, rgb, adalight_frame, load_config
 
 
 def primary(label='happy', uncertain=False):
@@ -81,6 +83,7 @@ class ControlTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
         self.cfg = load_config(ROOT / 'configs/light.json')
+        self.cfg.pop('current_alignment', None)
         self.light = Lighting(self.cfg, self.clock)
         self.light.session('start', 'owner')
 
@@ -169,6 +172,7 @@ class WorkerTests(unittest.TestCase):
         cfg = load_config(ROOT / 'configs/light.json')
         cfg['keepalive_ms'] = 100
         cfg['brightness'] = 0.25  # Fixed fixture, independent of deployment brightness.
+        cfg.pop('current_alignment', None)
         sent = []
         connects = []
         failed = threading.Event()
@@ -177,7 +181,7 @@ class WorkerTests(unittest.TestCase):
                 pass
             def connect(self):
                 connects.append(time.monotonic())
-                return {'version': 'fake', 'led_count': 30}
+                return {'version': 'fake', 'led_count': cfg['led_count']}
             def send(self, color):
                 if not failed.is_set():
                     failed.set()
@@ -260,5 +264,187 @@ class SerialHangupTests(unittest.TestCase):
         self.assertFalse(light.thread.is_alive())
 
 
-if __name__ == '__main__':
-    unittest.main(verbosity=2)
+
+
+def result(labels, reverse=False, uncertain=(), mirror=True):
+    faces=[dict(x1=i*200+20,y1=30,x2=i*200+150,y2=180,
+                emotion=dict(label=label,label_zh=label,uncertain=i in uncertain))
+           for i,label in enumerate(labels)]
+    return dict(count=len(faces),faces=list(reversed(faces)) if reverse else faces,
+                frame=dict(w=1600,h=900),mirror=mirror)
+
+
+class GroupTests(unittest.TestCase):
+    def setUp(self):
+        self.now=0
+        cfg=load_config(Path(__file__).resolve().parents[1]/'configs/light.json')
+        cfg['group_mode']='spatial'
+        cfg.pop('current_alignment', None)  # Also retain the percentage-mode contract.
+        cfg.update(brightness=.1, mixed_brightness=.6, group_brightness=[.35,.6])
+        self.light=Lighting(cfg,clock=lambda:self.now)
+        self.light.session('start','group-test')
+        self.seq=0
+
+    def put(self,now,labels,**kw):
+        self.now=now;self.seq+=1
+        payload=result(labels,**kw)
+        state=self.light.accept(self.light.ticket('group-test',self.seq),payload)
+        return state,payload
+
+    def test_all_agree_tiers_and_no_three_person_cap(self):
+        for n,power in [(1,.1),(2,.35),(3,.35),(4,.6),(6,.6)]:
+            self.light.session('stop','group-test');self.light.session('start','group-test')
+            start=self.now+.1
+            self.put(start,['happy']*n)
+            state,_=self.put(start+.35,['happy']*n)
+            self.assertTrue(state['group']['agreed'])
+            self.assertEqual(len(state['group']['people']),n)
+            self.assertEqual(state['transition']['to_power'],power)
+
+    def test_mixed_proportions_spatial_pixels_and_mirror(self):
+        labels=['happy','happy','sad']
+        self.put(0,labels)
+        state,_=self.put(.35,labels)
+        self.assertEqual(state['current']['label'],'mixed')
+        self.assertEqual({c['label']:c['count'] for c in state['group']['composition']},{'happy':2,'sad':1})
+        pixels=state['transition']['to_pixels']
+        self.assertEqual(pixels[0],rgb(PALETTE['sad']))
+        self.assertEqual(pixels[-1],rgb(PALETTE['happy']))
+        self.assertTrue(any(p not in [rgb(PALETTE['sad']),rgb(PALETTE['happy'])] for p in pixels))
+        self.assertEqual(state['transition']['to_power'],.6)
+        state,_=self.put(.7,labels,mirror=False)
+        self.assertEqual(state['transition']['to_pixels'][0],rgb(PALETTE['happy']))
+
+    def test_detector_order_and_motion_keep_ids(self):
+        _,first=self.put(0,['happy','sad'])
+        state,second=self.put(.35,['happy','sad'],reverse=True)
+        self.assertEqual([p['track_id'] for p in first['faces']],[p['track_id'] for p in reversed(second['faces'])])
+        moving=result(['happy','sad'])
+        for face in moving['faces']:
+            face['x1']+=20;face['x2']+=20
+        self.now=.7
+        self.light.accept(self.light.ticket('group-test',3),moving)
+        self.assertEqual([p['track_id'] for p in first['faces']],[p['track_id'] for p in moving['faces']])
+
+    def test_pending_prevents_boost_and_uncertain_expires_independently(self):
+        self.put(0,['happy','happy'],uncertain=(1,))
+        state,_=self.put(.35,['happy','happy'],uncertain=(1,))
+        self.assertFalse(state['group']['agreed'])
+        self.assertEqual(state['transition']['to_power'],.1)
+        self.put(.7,['happy','sad'])
+        self.put(1.05,['happy','sad'])
+        state,_=self.put(1.4,['happy','sad'],uncertain=(1,))
+        self.assertEqual(state['current']['label'],'mixed')
+        state,_=self.put(2.31,['happy','sad'],uncertain=(1,))
+        self.assertEqual(state['group']['confirmed_count'],1)
+        self.assertEqual(state['transition']['to_power'],.1)
+        self.assertFalse(state['group']['agreed'])
+
+    def test_leave_grace_return_single_stop_and_epoch(self):
+        self.put(0,['happy','sad']);self.put(.35,['happy','sad'])
+        state,_=self.put(.7,['happy'])
+        self.assertEqual(state['group']['confirmed_count'],2)
+        self.now=1.59
+        self.assertEqual(self.light.snapshot()['group']['confirmed_count'],2)
+        state,_=self.put(1.61,['happy'])
+        self.assertEqual(len(state['group']['people']),1)
+        self.assertEqual(state['current']['label'],'happy')
+        ticket=self.light.ticket('group-test',99)
+        self.light.session('stop','group-test')
+        state=self.light.accept(ticket,result(['sad']*4))
+        self.assertEqual(state['group']['people'],[])
+        self.assertEqual(state['mode'],'standby')
+
+    def test_no_faces_and_stall_return_standby(self):
+        self.put(0,['happy','sad']);self.put(.35,['happy','sad'])
+        self.put(.7,[])
+        self.now=1.61
+        self.assertEqual(self.light.snapshot()['mode'],'standby')
+        self.put(2,['happy','sad']);self.put(2.35,['happy','sad'])
+        self.now=4.26
+        self.assertEqual(self.light.snapshot()['mode'],'standby')
+
+    def test_pixel_packet_keeps_distinct_colors(self):
+        packet=adalight_frame([(255,0,0),(0,0,255)],2)
+        self.assertEqual(packet,b'Ada\x00\x01\x54\xff\x00\x00\x00\x00\xff')
+        with self.assertRaises(ValueError):adalight_frame([(1,2,3)],2)
+
+    def test_cycle_keeps_composition_and_obeys_owner(self):
+        self.assertFalse(self.light.layout('cycle','observer'))
+        self.assertTrue(self.light.layout('cycle','group-test'))
+        self.put(0,['happy','happy','sad']);state,_=self.put(.35,['happy','happy','sad'])
+        key=state['group']['key']
+        self.assertEqual(state['output_label'],'happy')
+        for t in [.7,1.05,1.4,1.75,2.1,2.45,2.8]:
+            state,_=self.put(t,['happy','happy','sad'])
+        self.assertEqual(state['output_label'],'sad')
+        self.assertEqual(state['group']['key'],key)
+        self.assertEqual(state['transition']['to_pixels'],[rgb(PALETTE['sad'])]*self.light.cfg['led_count'])
+        self.assertEqual(state['transition']['to_power'],.6)
+
+
+
+class CurrentAlignmentTests(unittest.TestCase):
+    def setUp(self):
+        self.cfg = load_config(ROOT / 'configs/light.json')
+        self.cfg.update(led_count=60, mixed_brightness=.6, standby_brightness=.06,
+                        current_alignment=dict(targets_ma=[220,450,700],led_ma=55,
+                                               controller_bri=128,reserve_ma=120,limit_ma=850))
+        self.now = 0.
+        self.light = Lighting(self.cfg, clock=lambda: self.now)
+        self.light.session('start', 'test')
+        self.seq = 0
+
+    def put(self, labels, uncertain=()):
+        self.now += .35
+        self.seq += 1
+        return self.light.accept(self.light.ticket('test', self.seq), result(labels, uncertain=uncertain))
+
+    def test_palette_tiers_and_integer_output(self):
+        for label in PALETTE:
+            for count, target in [(1,220), (2,450), (3,450), (4,700), (6,700)]:
+                with self.subTest(label=label, count=count):
+                    self.light.session('stop', 'test')
+                    self.light.session('start', 'test')
+                    self.put([label]*count)
+                    state = self.put([label]*count)
+                    self.now += .5
+                    state = self.light.snapshot()
+                    self.assertEqual(state['current_target_ma'], target)
+                    self.assertTrue(state['group']['agreed'])
+                    channels = sum(round(c*state['power']) for p in state['pixels'] for c in p)
+                    estimated = 120 + channels*55*128//(765*255)
+                    self.assertLessEqual(abs(estimated-target), 4)
+                    self.assertLess(estimated, 790)
+                    self.assertTrue(0 <= state['power'] <= 1)
+
+    def test_mixed_pending_and_standby(self):
+        self.put(['happy','sad']); state=self.put(['happy','sad'])
+        self.assertIsNone(state['current_target_ma'])
+        self.assertEqual(state['transition']['to_power'], .6)
+        self.put(['happy','sad'], uncertain=(1,))
+        for _ in range(3):
+            state=self.put(['happy','sad'], uncertain=(1,))
+        self.assertEqual(state['current_target_ma'],220)
+        self.assertFalse(state['group']['agreed'])
+        self.light.session('stop','test')
+        self.now += .5
+        state=self.light.snapshot()
+        self.assertIsNone(state['current_target_ma'])
+        self.assertEqual(state['power'], .06)
+
+    def test_legacy_config_and_invalid_calibration(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path=Path(temp)/'light.json'
+            for bad in [dict(targets_ma=[220,450,850]),dict(targets_ma=[450,220,700]),
+                        dict(led_ma=0),dict(controller_bri=0),dict(targets_ma=[220,float('nan'),700])]:
+                cfg=copy.deepcopy(self.cfg);cfg['current_alignment'].update(bad)
+                path.write_text(json.dumps(cfg))
+                with self.assertRaises(ValueError):load_config(path)
+            cfg=copy.deepcopy(self.cfg);cfg.pop('current_alignment')
+            path.write_text(json.dumps(cfg))
+            self.assertNotIn('current_alignment',load_config(path))
+
+
+
+if __name__ == '__main__': unittest.main(verbosity=2)

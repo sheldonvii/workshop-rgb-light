@@ -1,3 +1,4 @@
+async function visual(){
 const fs=require('node:fs'),path=require('node:path');
 const {ROOT,BASE,sleep,output,openBrowser,serverPid}=require('./browser');
 const OUT=output('ui');
@@ -74,7 +75,108 @@ async function main(){
  check('live result announced',await ev("$('currentLabel').getAttribute('aria-live')==='polite'"));
  check('no javascript errors',!browser.errors.length,browser.errors);
 }
-main().catch(e=>{report.failed=true;report.error=e.stack;console.error(e)}).finally(async()=>{
+return main().catch(e=>{report.failed=true;report.error=e.stack;console.error(e)}).finally(async()=>{
  report.javascriptErrors=browser?.errors||[];if(report.javascriptErrors.length)report.failed=true;
  await browser?.close();fs.writeFileSync(path.join(OUT,'report.json'),JSON.stringify(report,null,2));process.exitCode=report.failed?1:0;
 });
+
+}
+async function group(){
+/* Real three-face fixture first, then marked synthetic composition UI tests. */
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path');
+const {BASE,ROOT,openBrowser,output,sleep}=require('./browser');
+let browser;
+async function main(){
+  browser=await openBrowser();await browser.navigate(BASE+'/?frames=test');
+  await browser.ev("$('btnMain').click()");assert(await browser.until("S.phase==='running'"));
+  const bytes=fs.readFileSync(path.join(output('multi-face'),'same-3.jpg')).toString('base64');
+  await browser.ev(`testFrames.blobs.multi=new Blob([Uint8Array.from(atob(${JSON.stringify(bytes)}),c=>c.charCodeAt(0))],{type:'image/jpeg'});testFrames.idx=4;testFrames.lastSwitch=performance.now()+60000`);
+  assert(await browser.until("LAMP.snapshot.group?.agreed&&LAMP.snapshot.group.confirmed_count===3"));
+  assert.equal(await browser.ev("$('currentEn').textContent"),'3 人一致');
+  assert.equal(await browser.ev("$('peopleList').children.length"),3);
+  for(const mode of ['spatial','cycle']){
+    await browser.ev(`$('groupMode').value=${JSON.stringify(mode)};$('groupMode').dispatchEvent(new Event('change'))`);
+    assert(await browser.until(`!layoutBusy&&LAMP.snapshot.group_mode===${JSON.stringify(mode)}`));
+  }
+  await browser.viewport(1440,900);
+  await browser.screenshot(path.join(output('multi-face'),'same-real.png'));
+  await browser.ev("$('btnMain').click();lightSessionQueue");
+  await browser.ev("window.qaFetch=fetch;window.fetch=(url,opts)=>url==='/api/light'?new Promise(()=>{}):qaFetch(url,opts)");
+  await sleep(350);
+  const fixture=JSON.parse(fs.readFileSync(path.join(output('multi-face'),'mixed-ui.json'),'utf8'));
+  fixture.light.owner=null;
+  await browser.ev(`S.phase='running';S.runId=null;S.lastCount=3;S.stale=false;S.lastOkTs=Date.now();S.lastFaces=${JSON.stringify(fixture.faces)};LAMP.reset();LAMP.apply(${JSON.stringify(fixture.light)});setBanner('warn','fixture','界面验证：合成情绪构成，非模型识别结果');renderCurrent();`);
+  assert.equal(await browser.ev("$('currentLabel').textContent"),'多种情绪');
+  assert(await browser.ev("$('groupSummary').textContent.includes('开心 2 人')&&$('groupSummary').textContent.includes('难过 1 人')"));
+  for(const theme of ['dark','light']){
+    for(const [w,h] of [[1440,900],[1280,720],[390,844],[320,740]]){
+      await browser.viewport(w,h);
+      await browser.ev(`document.documentElement.dataset.theme=${JSON.stringify(theme)};S.lastOkTs=Date.now();updateWeather()`);await sleep(650);
+      assert(await browser.ev('document.documentElement.scrollWidth<=innerWidth'));
+      assert(await browser.until("[...document.querySelectorAll('.group-scene')].some(el=>Number(getComputedStyle(el).opacity)>.999)",3000),JSON.stringify(await browser.ev("({theme:document.documentElement.dataset.theme,mood:document.body.dataset.mood,sceneKey,styles:[...document.querySelectorAll('.group-scene')].map(el=>({style:el.style.cssText,opacity:getComputedStyle(el).opacity}))})")));
+      await browser.screenshot(path.join(output('multi-face'),`mixed-${theme}-${w}.png`));
+    }
+  }
+  await browser.ev("$('peopleList').children[0].click()");
+  assert(await browser.ev("$('settingsDrawer').open&&$('personSelect').value===String(selectedPerson)"));
+  await browser.ev("$('personSelect').value=$('personSelect').options[2].value;$('personSelect').dispatchEvent(new Event('change'))");
+  assert(await browser.ev("$('rawResult').textContent.includes('开心')"));
+  await browser.screenshot(path.join(output('multi-face'),'person-settings.png'));
+  await browser.ev("$('closeSettings').click();S.phase='idle';S.runId=null;LAMP.reset();renderCurrent()");
+  assert.equal(browser.errors.length,0,JSON.stringify(browser.errors));
+  console.log('PASS real 3-person brightness, curved group light/background, 8 viewports/themes, per-person scores; mixed UI uses marked synthetic fixture');
+}
+return main().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{await browser?.close()});
+
+}
+async function shared(){
+/* Two real browser clients share one backend lamp, using labelled test images. */
+const assert=require('node:assert/strict');
+const path=require('node:path');
+const {BASE,openBrowser,output,sleep}=require('./browser');
+let owner,observer;
+async function main(){
+ owner=await openBrowser();observer=await openBrowser();
+ await owner.navigate(BASE+'/?frames=test');
+ await owner.ev("$('btnMain').click()");
+ assert(await owner.until("S.phase==='running'"));
+ await owner.ev("testFrames.idx=1;testFrames.lastSwitch=performance.now()+60000");
+ assert(await owner.until("LAMP.current?.label==='neutral'"));
+ const id=await owner.ev('S.runId');
+ await observer.navigate(BASE+'/?frames=test');
+ assert(await observer.until("S.phase==='idle'&&LAMP.current?.label==='neutral'"));
+ assert.equal(await observer.ev('LAMP.snapshot.owner'),id);
+ await observer.ev("$('btnMain').click()");
+ assert(await observer.until("S.phase==='idle'&&S.bannerId==='light-owner'"));
+ assert.equal(await owner.ev('LAMP.snapshot.owner'),id);
+ await observer.navigate(BASE);
+ assert(await observer.until("LAMP.current?.label==='neutral'"));
+ await owner.screenshot(path.join(output('lighting'),'owner-neutral.png'));
+ await observer.screenshot(path.join(output('lighting'),'observer-neutral.png'));
+ await owner.ev("testFrames.idx=4;testFrames.lastSwitch=performance.now()+60000");
+ assert(await owner.until("S.lastCount===3&&LAMP.snapshot.group.people.length===3"));
+ assert(await observer.until("LAMP.snapshot.group.people.length===3"));
+ assert(await owner.ev('S.lastFaces.every(f=>f.emotion?.distribution.length===8)'));
+ await sleep(500);
+
+ await owner.screenshot(path.join(output('lighting'),'multi-group.png'));
+ await owner.ev("$('btnMain').click();lightSessionQueue");
+ assert(await observer.until('LAMP.snapshot.owner===null'));
+ assert.equal(owner.errors.length+observer.errors.length,0);
+ console.log('PASS shared backend color, observer reload, ownership conflict, multi-person light, stop release');
+}
+return main().catch(e=>{console.error(e);process.exitCode=1}).finally(async()=>{await owner?.close();await observer?.close()});
+
+}
+
+const cases={visual,group,shared};
+async function run(){
+ const index=process.argv.indexOf('--case');
+ const selected=index<0?Object.keys(cases):[process.argv[index+1]];
+ for(const name of selected){
+  if(!cases[name])throw Error('Unknown UI case: '+name);
+  console.log('CASE',name);await cases[name]();
+  if(process.exitCode)throw Error('UI case failed: '+name);
+ }
+}
+run().catch(e=>{console.error(e);process.exitCode=1});

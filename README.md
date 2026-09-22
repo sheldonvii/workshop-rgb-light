@@ -37,24 +37,25 @@ export UV_CACHE_DIR="$PWD/.uv-cache"
 
 权重不进入 Git。下载脚本维护四个在用模型的来源和 SHA-256；已有文件校验不符时会报错，不覆盖。已有环境可直接运行 `./run.sh`。
 
-## 快速检查
+## 一键检查
 
-开始体验后，确认相机有画面、单人表情能更新，页面显示控制器已连接。停止体验后，灯带应渐变回待机光。也可在服务运行时执行：
+在其他网页停止体验后执行，测试会切换模型并短暂改变灯色；需要 Node.js 22+、系统 Chromium、摄像头和已连接的控制器。
 
 ```bash
-.venv/bin/python scripts/smoke_vision.py
+./run_test.sh
 ```
 
-完整接口、灯光、浏览器和摄像头测试见 [开发验证](docs/development.md#测试与复现)。
+检查覆盖灯光规则、模型文件、接口、页面交互、真实摄像头和 USB 控制器。没有服务时临时启动并在结束后停止；已有服务则保留，并恢复原模型和灯光模式。失败时终端会指出环节、日志路径和排查建议。
 
+最近一次的汇总为 `tests/output/latest/summary.txt`，机器可读报告为 `report.json`，详细日志与截图在同目录。每次运行覆盖上一轮输出，返回码非零表示失败。仅检查代码用 `./run_test.sh --unit`，无摄像头和控制器时用 `./run_test.sh --no-hardware`；被跳过的项目不会算作通过。长时间验证与灯珠寻址说明见 [开发验证](docs/development.md#测试与复现)。
 ## 目录
 
 | 路径 | 用途 |
 | --- | --- |
 | `server/`、`configs/` | HTTP 服务、推理和模型配置 |
 | `web/` | 页面、后端灯光状态显示和共用测试帧 |
-| `scripts/` | 模型下载校验、运行中服务冒烟 |
-| `tests/` | 后端灯光、接口与浏览器测试 |
+| `scripts/` | 模型下载与校验 |
+| `run_test.sh`、`tests/` | 统一检查入口、测试与最近一次报告 |
 | `docs/controller.md` | 控制器接线、权限、参数与排障 |
 | `docs/development.md` | 当前行为、API、环境约束与开发验证 |
 | `licenses/` | 第三方许可和来源 |
