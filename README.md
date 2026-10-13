@@ -15,7 +15,7 @@ ls -l /dev/serial/by-id/
 sudo usermod -aG dialout bianbu  # 如使用其他账户，替换为实际用户名
 ```
 
-退出并重新登录，执行 `id` 确认包含 `dialout`；日常运行无需 sudo。修改 [configs/light.json](configs/light.json) 的 `port` 和 `led_count`，与实际设备一致。仅体验网页时，可将 `enabled` 设为 `false`。
+退出并重新登录，执行 `id` 确认包含 `dialout`；日常运行无需 sudo。项目固定使用 60 颗，仅需核对 [configs/light.json](configs/light.json) 的 `port`。出厂控制器仍为 30 颗时，按 [USB 配置为 60 颗](docs/prepare-wled.md) 执行一次准备脚本。仅体验网页时，可将 `enabled` 设为 `false`。
 
 接线、WLED 设置、完整参数、迁移与排障见 [控制器说明](docs/controller.md)。
 
@@ -54,7 +54,7 @@ export UV_CACHE_DIR="$PWD/.uv-cache"
 | --- | --- |
 | `server/`、`configs/` | HTTP 服务、推理和模型配置 |
 | `web/` | 页面、后端灯光状态显示和共用测试帧 |
-| `scripts/` | 模型下载与校验 |
+| `scripts/` | 模型下载校验、控制器首次准备 |
 | `run_test.sh`、`tests/` | 统一检查入口、测试与最近一次报告 |
 | `docs/controller.md` | 控制器接线、权限、参数与排障 |
 | `docs/development.md` | 当前行为、API、环境约束与开发验证 |

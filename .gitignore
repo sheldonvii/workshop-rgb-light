@@ -4,3 +4,7 @@ models/
 tests/output/
 __pycache__/
 *.pyc
+
+# Controller maintenance environment and private device backups
+.venv-controller/
+controller-backups/
