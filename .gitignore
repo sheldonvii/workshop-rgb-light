@@ -5,6 +5,6 @@ tests/output/
 __pycache__/
 *.pyc
 
-# Controller maintenance environment and private device backups
+# 控制器维护环境与私有设备备份
 .venv-controller/
 controller-backups/
