@@ -1,69 +1,100 @@
 /* 情绪晴雨表 — 页面逻辑。
  * 状态机：idle（未启动）→ starting（确认服务→确认摄像头轨道→预览）→ running → stopping → idle
  * running 内人数子状态：wait（无人）/ ok（单人识别中）/ multi（多人）
- * 异常：服务异常、摄像头异常（权限/无设备/占用/断开）、结果失效（stale）— 均有文案与恢复方式。
+ * 服务和相机异常分别提示；编码挂起时相机断开的恢复边界见开发说明。
  * 调度：同时最多一个推理请求在途；响应按 run_id+seq 校验，过期与跨运行结果丢弃；页面隐藏暂停提交。
  */
 "use strict";
 
 const CFG = {
-  submitIntervalMs: 350,   // 抓帧提交节奏（忙则跳帧）
+  submitIntervalMs: 350, // 抓帧提交节奏（忙则跳帧）
   fetchTimeoutMs: 6000,
-  staleAfterMs: 5000,      // 超过该时长无新结果 → 结果失效
-  failBannerAfter: 3,      // 连续失败次数 → 服务异常横幅
+  staleAfterMs: 5000, // 超过该时长无新结果 → 结果失效
+  failBannerAfter: 3, // 连续失败次数 → 服务异常横幅
   jpegQuality: 0.8,
   timelineRenderMax: 12,
   timelineKeepMax: 60,
 };
 
-const MOOD_COLOR = {
-  happy: "#FFD000", surprise: "#FF780A", neutral: "#00D9A6",
-  sad: "#246BFF", angry: "#FF2010", fear: "#8000FF", disgust: "#55DD00",
-  contempt: "#FF269C",
-};
+// 模型与确认规则由 health 提供；加载前不伪造类别和时序。
+let MOOD_COLOR = {},
+  LABEL_ZH = {};
+let activeLabels = [],
+  currentModel = null,
+  changingModel = false;
+let presentation = null,
+  lightSyncStarted = false;
 
 /* 隔离的测试帧源模式（仅 ?frames=test 显式开启；正式入口默认摄像头，不受影响）。
  * 开启后：抓帧来自 web/test-frames/ 官方测试图，POST 同一 /api/infer，结果为真实推理。
  * 用于无现场人员时验证 无人/单人/多人 页面状态。运行时页面显示常驻标注。 */
-const FRAME_TEST = new URLSearchParams(location.search).get("frames") === "test";
-const TEST_CYCLE = ["none", "single", "single", "single", "multi", "multi", "single", "single", "none"];
+const FRAME_TEST =
+  new URLSearchParams(location.search).get("frames") === "test";
+const TEST_CYCLE = [
+  "none",
+  "single",
+  "single",
+  "single",
+  "multi",
+  "multi",
+  "single",
+  "single",
+  "none",
+];
 const TEST_FRAME_MS = 1400;
 const testFrames = { blobs: {}, idx: 0, lastSwitch: 0, imgEl: null };
 
 const $ = (id) => document.getElementById(id);
 const els = {
-  btn: $("btnMain"), btnLabel: $("btnMainLabel"), btnIcon: $("btnMainIcon"),
-  svc: $("svcBadge"), svcText: $("svcText"),
-  banner: $("banner"), bannerIcon: $("bannerIcon"), bannerText: $("bannerText"), bannerBtn: $("bannerBtn"),
-  video: $("video"), overlay: $("overlay"),
-  stage: $("stage"), stageIdle: $("stageIdle"), stageStatus: $("stageStatus"), stageStatusIcon: $("stageStatusIcon"),
-  stageStatusText: $("stageStatusText"), stageMeta: $("stageMeta"),
-  currentPanel: $("currentPanel"), currentLabel: $("currentLabel"), currentEn: $("currentEn"),
-  currentScore: $("currentScore"), currentTime: $("currentTime"), currentNote: $("currentNote"),
-  comment: $("comment"), timeline: $("timeline"), timelineEmpty: $("timelineEmpty"),
+  btn: $("btnMain"),
+  btnLabel: $("btnMainLabel"),
+  btnIcon: $("btnMainIcon"),
+  svc: $("svcBadge"),
+  svcText: $("svcText"),
+  banner: $("banner"),
+  bannerIcon: $("bannerIcon"),
+  bannerText: $("bannerText"),
+  bannerBtn: $("bannerBtn"),
+  video: $("video"),
+  overlay: $("overlay"),
+  stage: $("stage"),
+  stageIdle: $("stageIdle"),
+  stageStatus: $("stageStatus"),
+  stageStatusIcon: $("stageStatusIcon"),
+  stageStatusText: $("stageStatusText"),
+  stageMeta: $("stageMeta"),
+  currentPanel: $("currentPanel"),
+  currentLabel: $("currentLabel"),
+  currentEn: $("currentEn"),
+  currentScore: $("currentScore"),
+  currentTime: $("currentTime"),
+  currentNote: $("currentNote"),
+  comment: $("comment"),
+  timeline: $("timeline"),
+  timelineEmpty: $("timelineEmpty"),
 };
 
-const ICONS = window.__ICONS || {};  // index.html 内联的 Lucide path 数据
+const ICONS = window.__ICONS; // index.html 内联的 Lucide path 数据
 
 const LAMP = new LightController();
 
 const S = {
-  phase: "idle",            // idle | starting | running | stopping
+  phase: "idle", // idle | starting | running | stopping
   runId: null,
   seq: 0,
   lastAcceptedSeq: 0,
-  inFlight: null,           // AbortController
+  inFlight: null, // AbortController
   stream: null,
   submitTimer: null,
-  trackInfo: null,          // {w,h,fps,label}
+  trackInfo: null, // {w,h,fps,label}
   lastOkTs: 0,
   runStartTs: 0,
   failCount: 0,
   stale: false,
-  bannerKind: null,         // null | "warn" | "danger"
-  bannerId: null,           // 当前横幅标识，避免覆盖更新的状态
-  timeline: [],             // [{label,zh,mood,score,t0,t1}]
-  accepted: [],             // 最近成功响应时间戳（推理更新率）
+  bannerKind: null, // null | "warn" | "danger"
+  bannerId: null, // 当前横幅标识，避免覆盖更新的状态
+  timeline: [], // [{label,zh,mood,score,t0,t1}]
+  accepted: [], // 最近成功响应时间戳（推理更新率）
   lastPrimary: null,
   lastCount: 0,
   lastTiming: null,
@@ -83,10 +114,14 @@ function icon(name, size = 18) {
 
 /* ---------------- 通用 UI ---------------- */
 function setBanner(kind, id, html, action) {
-  S.bannerKind = kind; S.bannerId = id;
+  S.bannerKind = kind;
+  S.bannerId = id;
   els.banner.dataset.kind = kind === "danger" ? "danger" : "warn";
-  els.bannerIcon.innerHTML = icon(kind === "danger" ? "triangle-alert" : "info", 18);
-  els.bannerText.textContent = html.replace(/<[^>]*>/g, '');
+  els.bannerIcon.innerHTML = icon(
+    kind === "danger" ? "triangle-alert" : "info",
+    18,
+  );
+  els.bannerText.textContent = html.replace(/<[^>]*>/g, "");
   if (action) {
     els.bannerBtn.hidden = false;
     els.bannerBtn.querySelector("span").textContent = action.label;
@@ -98,7 +133,7 @@ function setBanner(kind, id, html, action) {
   els.banner.hidden = false;
 }
 function clearBanner(id) {
-  if (id && S.bannerId !== id) return;  // 只清自己那类
+  if (id && S.bannerId !== id) return; // 只清自己那类
   S.bannerId = null;
   els.banner.hidden = true;
 }
@@ -108,7 +143,7 @@ function setSvc(state, text) {
   els.svcText.textContent = text;
 }
 function setMainButton(mode) {
-  // Initialization stays cancellable while the permission prompt is pending.
+  // 权限请求可能悬挂，开启过程中仍须允许取消。
   if (mode === "start") {
     els.btn.disabled = false;
     els.btn.className = "btn btn-primary";
@@ -126,7 +161,7 @@ function setMainButton(mode) {
     els.btnLabel.textContent = "停止";
   }
   updateStageStatus();
-  document.dispatchEvent(new Event('barometer-update'));
+  document.dispatchEvent(new Event("barometer-update"));
 }
 
 /* ---------------- 服务健康 ---------------- */
@@ -134,7 +169,10 @@ async function fetchHealth(timeoutMs = 4000) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch("/api/health", { signal: ctl.signal, cache: "no-store" });
+    const r = await fetch("/api/health", {
+      signal: ctl.signal,
+      cache: "no-store",
+    });
     const j = await r.json().catch(() => ({}));
     return { httpOk: r.ok, body: j };
   } finally {
@@ -161,126 +199,241 @@ async function start() {
   setMainButton("busy");
   clearBanner();
 
-  // 1) 先确认服务可用
+  // 先确认服务可用
   let health;
   try {
     health = await fetchHealth(5000);
     if (generation !== S.generation) return;
   } catch {
     if (generation !== S.generation) return;
-    S.phase = "idle"; setMainButton("start"); setSvc("error", "推理服务不可达");
-    setBanner("danger", "svc",
+    S.phase = "idle";
+    setMainButton("start");
+    setSvc("error", "推理服务不可达");
+    setBanner(
+      "danger",
+      "svc",
       "无法连接推理服务。请确认服务已启动（在工程目录执行 <code>./run.sh</code>），然后重试。",
-      { label: "重试", onClick: () => { void start(); } });
+      {
+        label: "重试",
+        onClick: () => {
+          void start();
+        },
+      },
+    );
     return;
   }
   if (!health.httpOk || !health.body.ok) {
     const st = health.body.state || "unknown";
-    S.phase = "idle"; setMainButton("start");
-    setSvc(st === "loading" ? "loading" : "error",
-      st === "loading" ? "模型加载中…" : "推理服务异常");
-    setBanner("danger", "svc",
+    S.phase = "idle";
+    setMainButton("start");
+    setSvc(
+      st === "loading" ? "loading" : "error",
+      st === "loading" ? "模型加载中…" : "推理服务异常",
+    );
+    setBanner(
+      "danger",
+      "svc",
       st === "loading"
         ? "模型正在加载，首次加载约需几秒。请稍候再开始。"
         : `推理服务未就绪（${health.body.message || st}）。可在终端查看 run.sh 输出定位。`,
-      { label: "重试", onClick: () => { void start(); } });
+      {
+        label: "重试",
+        onClick: () => {
+          void start();
+        },
+      },
+    );
     return;
   }
   setSvc("ready", "推理服务就绪");
-  if (typeof applyModelInfo === 'function') void applyModelInfo(health.body);
+  try {
+    applyModelInfo(health.body);
+  } catch (error) {
+    S.phase = "idle";
+    setMainButton("start");
+    setBanner("danger", "svc", error.message);
+    return;
+  }
 
-  // 1.5) 隔离测试帧源：跳过摄像头，用官方测试图走同一推理接口
+  // 隔离测试帧源：跳过摄像头，用官方测试图走同一推理接口
   if (FRAME_TEST) {
     try {
       for (const name of new Set(TEST_CYCLE)) {
-        const r = await fetch(`/test-frames/${name}.jpg`, { cache: "no-store" });
+        const r = await fetch(`/test-frames/${name}.jpg`, {
+          cache: "no-store",
+        });
         if (!r.ok) throw new Error(`fetch ${name}: ${r.status}`);
         testFrames.blobs[name] = await r.blob();
       }
     } catch (err) {
       if (generation !== S.generation) return;
-      S.phase = "idle"; setMainButton("start");
-      setBanner("danger", "cam", `测试帧源加载失败（${err.message}）。请确认 web/test-frames/ 完整。`);
+      S.phase = "idle";
+      setMainButton("start");
+      setBanner(
+        "danger",
+        "cam",
+        `测试帧源加载失败（${err.message}）。请确认 web/test-frames/ 完整。`,
+      );
       return;
     }
     if (generation !== S.generation) return;
     S.trackInfo = { w: 1280, h: 720, fps: 0, label: "测试帧源（官方测试图）" };
     await beginRunning();
-    if(S.phase!=='running')return;
-    setBanner("warn", "testsrc",
-      "测试帧源模式：画面与结果来自官方测试图的真实推理，非摄像头采集。关闭地址里的 ?frames=test 即回到正式入口。");
+    if (S.phase !== "running") return;
+    setBanner(
+      "warn",
+      "testsrc",
+      "测试帧源模式：画面与结果来自官方测试图的真实推理，非摄像头采集。关闭地址里的 ?frames=test 即回到正式入口。",
+    );
     return;
   }
 
-  // 2) 再请求摄像头（权限申请）
+  // 再请求摄像头（权限申请）
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      video: {
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30 },
+      },
       audio: false,
     });
   } catch (err) {
     if (generation !== S.generation) return;
-    S.phase = "idle"; setMainButton("start");
+    S.phase = "idle";
+    setMainButton("start");
     const name = err && err.name;
     if (name === "NotAllowedError") {
-      setBanner("danger", "cam",
+      setBanner(
+        "danger",
+        "cam",
         "摄像头权限被拒绝。点击浏览器地址栏左侧的站点图标，把摄像头改为“允许”，然后重试。",
-        { label: "重试", onClick: () => { void start(); } });
+        {
+          label: "重试",
+          onClick: () => {
+            void start();
+          },
+        },
+      );
     } else if (name === "NotFoundError" || name === "OverconstrainedError") {
-      setBanner("danger", "cam", "未检测到可用摄像头。请确认 USB 摄像头已连接并被系统识别，然后重试。",
-        { label: "重试", onClick: () => { void start(); } });
+      setBanner(
+        "danger",
+        "cam",
+        "未检测到可用摄像头。请确认 USB 摄像头已连接并被系统识别，然后重试。",
+        {
+          label: "重试",
+          onClick: () => {
+            void start();
+          },
+        },
+      );
     } else if (name === "NotReadableError") {
-      setBanner("danger", "cam", "摄像头被其他程序占用，无法启动采集。请关闭占用摄像头的程序后重试。",
-        { label: "重试", onClick: () => { void start(); } });
+      setBanner(
+        "danger",
+        "cam",
+        "摄像头被其他程序占用，无法启动采集。请关闭占用摄像头的程序后重试。",
+        {
+          label: "重试",
+          onClick: () => {
+            void start();
+          },
+        },
+      );
     } else {
-      setBanner("danger", "cam", `摄像头启动失败（${name || err}）。请重新插拔摄像头后重试。`,
-        { label: "重试", onClick: () => { void start(); } });
+      setBanner(
+        "danger",
+        "cam",
+        `摄像头启动失败（${name || err}）。请重新插拔摄像头后重试。`,
+        {
+          label: "重试",
+          onClick: () => {
+            void start();
+          },
+        },
+      );
     }
     return;
   }
 
-  // 3) 确认轨道实际参数（必须真实 ≥1280×720，不以放大冒充）
-  if (generation !== S.generation) { stream.getTracks().forEach(t => t.stop()); return; }
+  // 确认轨道实际参数（必须真实 ≥1280×720，不以放大冒充）
+  if (generation !== S.generation) {
+    stream.getTracks().forEach((t) => t.stop());
+    return;
+  }
   const track = stream.getVideoTracks()[0];
   const st = track.getSettings();
-  S.trackInfo = { w: st.width || 0, h: st.height || 0, fps: st.frameRate || 0, label: track.label || "" };
+  S.trackInfo = {
+    w: st.width || 0,
+    h: st.height || 0,
+    fps: st.frameRate || 0,
+    label: track.label || "",
+  };
   if (S.trackInfo.w < 1280 || S.trackInfo.h < 720) {
     stream.getTracks().forEach((t) => t.stop());
-    S.phase = "idle"; setMainButton("start");
-    setBanner("danger", "cam",
+    S.phase = "idle";
+    setMainButton("start");
+    setBanner(
+      "danger",
+      "cam",
       `采集分辨率不足：实际轨道 ${S.trackInfo.w}×${S.trackInfo.h}，要求至少 1280×720。请检查摄像头能力与连接（USB 端口/线缆），然后重试。`,
-      { label: "重试", onClick: () => { void start(); } });
+      {
+        label: "重试",
+        onClick: () => {
+          void start();
+        },
+      },
+    );
     return;
   }
 
-  // 4) 预览 + 开始提交
+  // 预览 + 开始提交
   els.video.srcObject = stream;
   S.stream = stream;
-  try { await els.video.play(); } catch { if (generation !== S.generation) return; stop(); setBanner('danger','cam','视频预览无法启动，请重试。'); return; }
-  if (generation !== S.generation) { stream.getTracks().forEach(t => t.stop()); return; }
+  try {
+    await els.video.play();
+  } catch {
+    if (generation !== S.generation) return;
+    stop();
+    setBanner("danger", "cam", "视频预览无法启动，请重试。");
+    return;
+  }
+  if (generation !== S.generation) {
+    stream.getTracks().forEach((t) => t.stop());
+    return;
+  }
   track.addEventListener("ended", onTrackEnded);
   await beginRunning();
 }
 
 async function beginRunning() {
-  const generation=S.generation;
-  const runId=(crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
-  S.runId=runId;
+  const generation = S.generation;
+  const runId =
+    (crypto.randomUUID && crypto.randomUUID()) || String(Date.now());
+  S.runId = runId;
   try {
-    const light=await lightSession('start',runId);
-    if(generation!==S.generation){void lightSession('stop',runId).catch(()=>{});return;}
+    const light = await lightSession("start", runId);
+    if (generation !== S.generation) {
+      void lightSession("stop", runId).catch(() => {});
+      return;
+    }
     LAMP.apply(light);
-  } catch(err) {
-    if(generation!==S.generation)return;
-    stop();setBanner('warn','light-owner',err.message);return;
+  } catch (err) {
+    if (generation !== S.generation) return;
+    stop();
+    setBanner("warn", "light-owner", err.message);
+    return;
   }
   S.phase = "running";
-  S.seq = 0; S.lastAcceptedSeq = 0;
-  S.lastOkTs = 0; S.failCount = 0; S.stale = false;
+  S.seq = 0;
+  S.lastAcceptedSeq = 0;
+  S.lastOkTs = 0;
+  S.failCount = 0;
+  S.stale = false;
   S.accepted = [];
   S.historyGap = true;
-  S.lastPrimary = null; S.lastCount = 0;
+  S.lastPrimary = null;
+  S.lastCount = 0;
   S.runStartTs = Date.now();
   setMainButton("stop");
   els.stageIdle.hidden = true;
@@ -293,7 +446,8 @@ async function beginRunning() {
       els.stage.insertBefore(img, els.overlay);
       testFrames.imgEl = img;
     }
-    testFrames.idx = 0; testFrames.lastSwitch = 0;
+    testFrames.idx = 0;
+    testFrames.lastSwitch = 0;
   }
   clearBanner("cam");
   updateStageStatus();
@@ -304,7 +458,8 @@ async function beginRunning() {
 
 function currentTestFrame(now) {
   if (!testFrames.lastSwitch || now - testFrames.lastSwitch >= TEST_FRAME_MS) {
-    if (testFrames.lastSwitch) testFrames.idx = (testFrames.idx + 1) % TEST_CYCLE.length;
+    if (testFrames.lastSwitch)
+      testFrames.idx = (testFrames.idx + 1) % TEST_CYCLE.length;
     testFrames.lastSwitch = now;
   }
   const name = TEST_CYCLE[testFrames.idx];
@@ -326,19 +481,36 @@ function stop() {
   S.encoding = false;
   S.historyGap = true;
   // 先停新帧、拒绝旧结果回写
-  if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
+  if (S.submitTimer) {
+    clearInterval(S.submitTimer);
+    S.submitTimer = null;
+  }
   S.runId = null;
-  if (S.inFlight) { S.inFlight.abort(); S.inFlight = null; }
+  if (S.inFlight) {
+    S.inFlight.abort();
+    S.inFlight = null;
+  }
   // 再释放采集
-  if (S.stream) { S.stream.getTracks().forEach((t) => t.stop()); S.stream = null; }
+  if (S.stream) {
+    S.stream.getTracks().forEach((t) => t.stop());
+    S.stream = null;
+  }
   els.video.srcObject = null;
-  if (testFrames.imgEl) { testFrames.imgEl.remove(); testFrames.imgEl = null; }
-  if (testFrames.url) { URL.revokeObjectURL(testFrames.url); testFrames.url = null; testFrames.urlName = null; }
+  if (testFrames.imgEl) {
+    testFrames.imgEl.remove();
+    testFrames.imgEl = null;
+  }
+  if (testFrames.url) {
+    URL.revokeObjectURL(testFrames.url);
+    testFrames.url = null;
+    testFrames.urlName = null;
+  }
   clearOverlay();
   // 界面复位（历史时间线保留，供回看）
   S.phase = "idle";
   S.stale = false;
-  S.lastPrimary = null; S.lastCount = 0;
+  S.lastPrimary = null;
+  S.lastCount = 0;
   S.lastFaces = [];
   document.body.dataset.mood = "none";
   els.stageIdle.hidden = false;
@@ -356,21 +528,40 @@ function onTrackEnded() {
   if (S.phase !== "running") return;
   releaseLight();
   S.generation++;
-  S.historyGap = true; S.lastFaces = [];
-  if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
+  S.historyGap = true;
+  S.lastFaces = [];
+  if (S.submitTimer) {
+    clearInterval(S.submitTimer);
+    S.submitTimer = null;
+  }
   S.runId = null;
-  if (S.inFlight) { S.inFlight.abort(); S.inFlight = null; }
-  if (S.stream) { S.stream.getTracks().forEach((t) => t.stop()); S.stream = null; }
+  if (S.inFlight) {
+    S.inFlight.abort();
+    S.inFlight = null;
+  }
+  if (S.stream) {
+    S.stream.getTracks().forEach((t) => t.stop());
+    S.stream = null;
+  }
   els.video.srcObject = null;
   clearOverlay();
   S.phase = "idle";
-  S.lastPrimary = null; S.lastCount = 0;
+  S.lastPrimary = null;
+  S.lastCount = 0;
   document.body.dataset.mood = "none";
   els.stageIdle.hidden = false;
   setMainButton("start");
-  setBanner("danger", "cam",
+  setBanner(
+    "danger",
+    "cam",
     "摄像头连接已中断（设备被拔出或掉线）。重新连接摄像头后点击重试。",
-    { label: "重试", onClick: () => { void start(); } });
+    {
+      label: "重试",
+      onClick: () => {
+        void start();
+      },
+    },
+  );
   updateStageStatus();
   renderCurrent();
   updateMeta();
@@ -381,7 +572,8 @@ const capCanvas = document.createElement("canvas");
 const capCtx = capCanvas.getContext("2d", { willReadFrequently: false });
 
 function submitTick() {
-  if (S.phase !== "running" || document.hidden || S.inFlight || S.encoding) return;
+  if (S.phase !== "running" || document.hidden || S.inFlight || S.encoding)
+    return;
   if (FRAME_TEST) {
     const name = currentTestFrame(performance.now());
     const blob = testFrames.blobs[name];
@@ -393,28 +585,39 @@ function submitTick() {
 
   capCanvas.width = v.videoWidth;
   capCanvas.height = v.videoHeight;
-  capCtx.drawImage(v, 0, 0);   // 预览与取帧共用同一条视频流；推理帧不做镜像
+  capCtx.drawImage(v, 0, 0); // 预览与取帧共用同一条视频流；推理帧不做镜像
   const generation = S.generation;
   S.encoding = true;
-  capCanvas.toBlob((blob) => {
-    if (generation !== S.generation) return;
-    S.encoding = false;
-    if (blob && S.phase === 'running' && !document.hidden && !S.inFlight) void sendFrame(blob);
-  }, "image/jpeg", CFG.jpegQuality);
+  capCanvas.toBlob(
+    (blob) => {
+      if (generation !== S.generation) return;
+      S.encoding = false;
+      if (blob && S.phase === "running" && !document.hidden && !S.inFlight)
+        void sendFrame(blob);
+    },
+    "image/jpeg",
+    CFG.jpegQuality,
+  );
 }
 
 async function sendFrame(blob) {
-  if (S.phase !== 'running' || S.inFlight) return;
+  if (S.phase !== "running" || S.inFlight) return;
   const seq = ++S.seq;
   const runId = S.runId;
   const ctl = new AbortController();
   S.inFlight = ctl;
   const sentTs = performance.now();
   const timer = setTimeout(() => ctl.abort(), CFG.fetchTimeoutMs);
+  let result;
   try {
     const r = await fetch("/api/infer", {
       method: "POST",
-      headers: { "Content-Type": "application/octet-stream", "X-Run-Id": runId, "X-Seq": String(seq), "X-Mirror": document.body.dataset.mirror !== 'false' ? 'true' : 'false' },
+      headers: {
+        "Content-Type": "application/octet-stream",
+        "X-Run-Id": runId,
+        "X-Seq": String(seq),
+        "X-Mirror": document.body.dataset.mirror !== "false" ? "true" : "false",
+      },
       body: blob,
       signal: ctl.signal,
     });
@@ -422,14 +625,18 @@ async function sendFrame(blob) {
     clearTimeout(timer);
     if (S.inFlight === ctl) S.inFlight = null;
 
-    if (S.phase !== "running" || S.runId !== runId) return;      // 跨运行：丢弃
-    if (!j) { onFail(); return; }
+    if (S.phase !== "running" || S.runId !== runId) return; // 跨运行：丢弃
+    if (!j) {
+      onFail();
+      return;
+    }
     if (j.ok) {
       if (j.run_id !== runId) return;
-      if (j.seq <= S.lastAcceptedSeq) return;                    // 过期：丢弃
+      if (j.seq <= S.lastAcceptedSeq) return; // 过期：丢弃
+      validateInference(j);
       S.lastAcceptedSeq = j.seq;
       S.e2eMs = Math.round(performance.now() - sentTs);
-      onResult(j);
+      result = j;
     } else if (j.error && j.error.code === "busy") {
       // 服务端正忙：正常丢帧，不计失败
     } else {
@@ -439,8 +646,19 @@ async function sendFrame(blob) {
     clearTimeout(timer);
     if (S.inFlight === ctl) S.inFlight = null;
     if (S.phase !== "running" || S.runId !== runId) return;
-    if (err && err.name === "AbortError") { onFail("推理请求超时"); return; }
+    if (err && err.name === "AbortError") {
+      onFail("推理请求超时");
+      return;
+    }
     onFail();
+    return;
+  }
+  if (result) {
+    try {
+      onResult(result);
+    } catch (error) {
+      console.error("推理页面更新失败", error);
+    }
   }
 }
 
@@ -448,8 +666,11 @@ function onFail(msg) {
   S.failCount += 1;
   if (S.failCount >= CFG.failBannerAfter) {
     setSvc("error", "推理服务异常");
-    setBanner("danger", "svc-live",
-      `推理服务连续无响应${msg ? `（${msg}）` : ""}。页面会自动重试；若持续异常，请到终端检查 run.sh 输出。`);
+    setBanner(
+      "danger",
+      "svc-live",
+      `推理服务连续无响应${msg ? `（${msg}）` : ""}。页面会自动重试；若持续异常，请到终端检查 run.sh 输出。`,
+    );
   }
   updateMeta();
 }
@@ -461,46 +682,74 @@ function onResult(j) {
   if (S.svcState !== "ready") setSvc("ready", "推理服务就绪");
 
   S.lastCount = j.count;
-  S.lastFaces = j.faces || [];
-  S.lastTiming = j.timing || null;
+  S.lastFaces = j.faces;
+  S.lastTiming = j.timing;
   const now = Date.now();
   S.accepted.push(now);
   while (S.accepted.length && now - S.accepted[0] > 10000) S.accepted.shift();
 
   const prevLabel = LAMP.current?.label;
-  S.lastPrimary = j.primary || null;
+  S.lastPrimary = j.primary;
   LAMP.apply(j.light);
   const stable = LAMP.current;
   document.body.dataset.mood = stable?.label || "none";
   let pushed = false;
   if (stable) {
     const tail = S.timeline[S.timeline.length - 1];
-    const group=LAMP.snapshot?.group;
-    const key=group?.key||stable.label;
-    const description=group?.people.length>1?group.composition.map(c=>`${c.label_zh} ${c.count} 人`).join(' · '):stable.label_zh;
+    const group = LAMP.snapshot?.group;
+    const key = group?.key || stable.label;
+    const description =
+      group?.people.length > 1
+        ? group.composition
+            .map((c) => `${c.label_zh} ${c.count} 人`)
+            .join(" · ")
+        : stable.label_zh;
     if (tail && !S.historyGap && tail.runId === S.runId && tail.key === key) {
-      tail.t1 = now; tail.score = stable.score;
+      tail.t1 = now;
+      tail.score = stable.score;
     } else {
-      S.timeline.push({key,label:stable.label, zh:description, mood:stable.label,
-        score:stable.score,t0:now,t1:now,runId:S.runId,scoreType:stable.score_type});
+      S.timeline.push({
+        key,
+        label: stable.label,
+        zh: description,
+        mood: stable.label,
+        score: stable.score,
+        t0: now,
+        t1: now,
+        runId: S.runId,
+        scoreType: stable.score_type,
+      });
       if (S.timeline.length > CFG.timelineKeepMax) S.timeline.shift();
       pushed = true;
     }
     S.historyGap = false;
-    renderComment(group?.people.length>1 ? `${description}。${group.agreed?'表情一致，灯光一起变亮。':'每个人保留自己的颜色。'}` : LAMP.status === 'stable' ? changeComment(prevLabel, stable) : '保留上一种灯色，等待下一次稳定确认。');
+    renderComment(
+      group?.people.length > 1
+        ? `${description}。${group.agreed ? "表情一致，灯光一起变亮。" : "每个人保留自己的颜色。"}`
+        : LAMP.status === "stable"
+          ? changeComment(prevLabel, stable)
+          : "保留上一种灯色，等待下一次稳定确认。",
+    );
   } else {
     S.historyGap = true;
-    renderComment(stable ? '保留上一种灯色，等待下一次稳定确认。' : j.primary?.uncertain
-      ? '几个表情分数接近，正在继续观察。' : j.count === 0
-      ? '看向镜头，灯光会在表情稳定后亮起。' : j.count > 1
-      ? '正在分别确认每个人的表情。' : '正在确认表情，保持自然就好。');
+    renderComment(
+      j.primary?.uncertain
+        ? "几个表情分数接近，正在继续观察。"
+        : j.count === 0
+          ? "看向镜头，灯光会在表情稳定后亮起。"
+          : j.count > 1
+            ? "正在分别确认每个人的表情。"
+            : "正在确认表情，保持自然就好。",
+    );
   }
 
-  if (S.stale) { S.stale = false; }
+  if (S.stale) {
+    S.stale = false;
+  }
   updateStageStatus();
-  drawOverlay(j.faces || [], j.primary);
+  drawOverlay(j.faces, j.primary);
   renderCurrent();
-  renderTimeline(pushed);   // 仅新条目带入场动画，其余情况静态刷新
+  renderTimeline(pushed); // 仅新条目带入场动画，其余情况静态刷新
   updateMeta();
 }
 
@@ -525,13 +774,15 @@ setInterval(() => {
   if (gap > CFG.staleAfterMs && !S.stale) {
     S.stale = true;
     S.historyGap = true;
-    document.body.dataset.mood = 'none';
+    document.body.dataset.mood = "none";
     clearOverlay();
     updateStageStatus();
     renderCurrent();
-    renderComment(S.lastOkTs
-      ? "结果更新中断，正在尝试恢复。若持续无更新，请检查推理服务。"
-      : "启动后一直没有收到推理结果。请检查推理服务状态，或停止后重试。");
+    renderComment(
+      S.lastOkTs
+        ? "结果更新中断，正在尝试恢复。若持续无更新，请检查推理服务。"
+        : "启动后一直没有收到推理结果。请检查推理服务状态，或停止后重试。",
+    );
   }
 }, 1000);
 
@@ -542,7 +793,8 @@ function updateStageStatus() {
     el.hidden = false;
     el.dataset.s = "wait";
     els.stageStatusIcon.innerHTML = icon("camera-off", 16);
-    els.stageStatusText.textContent = S.phase === 'starting' ? '正在开启' : "未启动";
+    els.stageStatusText.textContent =
+      S.phase === "starting" ? "正在开启" : "未启动";
     return;
   }
   if (S.lastCount === 0) {
@@ -563,8 +815,11 @@ function updateStageStatus() {
 function renderCurrent() {
   const p = LAMP.current;
   const on = !!p;
-  document.dispatchEvent(new Event('barometer-update'));
-  els.currentPanel.classList.toggle("current-panel-stale", S.phase === "running" && S.stale && !!p);
+  document.dispatchEvent(new Event("barometer-update"));
+  els.currentPanel.classList.toggle(
+    "current-panel-stale",
+    S.phase === "running" && S.stale && !!p,
+  );
   if (S.phase !== "running" && !p) {
     setCurrentLabel("待开始");
     els.currentLabel.dataset.on = "false";
@@ -575,27 +830,62 @@ function renderCurrent() {
     return;
   }
   if (!p) {
-    setCurrentLabel(S.lastPrimary?.uncertain ? "观察中" : S.lastCount > 0 ? "确认中" : "等你入镜");
+    setCurrentLabel(
+      S.lastPrimary?.uncertain
+        ? "观察中"
+        : S.lastCount > 0
+          ? "确认中"
+          : "等你入镜",
+    );
     els.currentLabel.dataset.on = "false";
     els.currentEn.textContent = "";
     els.currentScore.textContent = "";
     els.currentTime.textContent = "";
-    els.currentNote.textContent = S.stale ? '结果已失效，等待恢复' : S.lastCount === 0 ? "等待入镜" : "逐人确认后点亮";
+    els.currentNote.textContent = S.stale
+      ? "结果已失效，等待恢复"
+      : S.lastCount === 0
+        ? "等待入镜"
+        : "逐人确认后点亮";
     return;
   }
-  setCurrentLabel(p.uncertain ? '不确定' : p.label_zh);
+  setCurrentLabel(p.uncertain ? "不确定" : p.label_zh);
   els.currentLabel.dataset.on = String(!!on);
   els.currentEn.textContent = p.uncertain ? `较接近${p.label_zh}` : p.label;
-  els.currentScore.textContent = LAMP.status !== "stable" ? "上一稳定结果" : p.score_type === 'softmax' ? `模型分数 ${(p.score * 100).toFixed(1)}%` : `原始分数 ${p.score}`;
-  const group=LAMP.snapshot?.group;
-  if(group?.people.length>1){
-    els.currentEn.textContent=group.agreed?`${group.confirmed_count} 人一致`:`${group.confirmed_count} 人已确认`;
-    els.currentScore.textContent=group.composition.map(c=>`${c.label_zh} ${c.count}`).join(' · ');
-    els.currentNote.textContent=group.agreed?'共同点亮':group.people.some(p=>p.status!=='stable'||!p.visible)?'部分表情待确认':'各有颜色';
+  els.currentScore.textContent =
+    LAMP.status !== "stable"
+      ? "上一稳定结果"
+      : p.score_type === "softmax"
+        ? `模型分数 ${(p.score * 100).toFixed(1)}%`
+        : `原始分数 ${p.score}`;
+  const group = LAMP.snapshot?.group;
+  if (group?.people.length > 1) {
+    els.currentEn.textContent = group.agreed
+      ? `${group.confirmed_count} 人一致`
+      : `${group.confirmed_count} 人已确认`;
+    els.currentScore.textContent = group.composition
+      .map((c) => `${c.label_zh} ${c.count}`)
+      .join(" · ");
+    els.currentNote.textContent = group.agreed
+      ? "共同点亮"
+      : group.people.some((p) => p.status !== "stable" || !p.visible)
+        ? "部分表情待确认"
+        : "各有颜色";
   }
-  els.currentTime.textContent = new Date(S.lastOkTs).toLocaleTimeString("zh-CN", { hour12: false });
-  els.currentNote.textContent = S.stale ? "结果失效" : LAMP.status !== "stable" ? "保持灯色" : "已稳定确认";
-  if(group?.people.length>1&&!S.stale)els.currentNote.textContent=group.agreed?'共同点亮':LAMP.status!=='stable'?'部分表情待确认':'各有颜色';
+  els.currentTime.textContent = new Date(S.lastOkTs).toLocaleTimeString(
+    "zh-CN",
+    { hour12: false },
+  );
+  els.currentNote.textContent = S.stale
+    ? "结果失效"
+    : LAMP.status !== "stable"
+      ? "保持灯色"
+      : "已稳定确认";
+  if (group?.people.length > 1 && !S.stale)
+    els.currentNote.textContent = group.agreed
+      ? "共同点亮"
+      : LAMP.status !== "stable"
+        ? "部分表情待确认"
+        : "各有颜色";
 }
 
 function renderComment(text) {
@@ -603,24 +893,39 @@ function renderComment(text) {
 }
 
 function setCurrentLabel(text) {
-  if (els.currentLabel.textContent !== text) els.currentLabel.textContent = text;
+  if (els.currentLabel.textContent !== text)
+    els.currentLabel.textContent = text;
 }
 
 function renderTimeline(markNew) {
   const items = S.timeline.slice(-CFG.timelineRenderMax).reverse();
   els.timelineEmpty.hidden = items.length > 0;
-  els.timeline.innerHTML = items.map((it, i) => {
-    const cur = i === 0 && S.phase === 'running' && !S.historyGap && LAMP.current && LAMP.current.label === it.label && !S.stale;
-    const dur = Math.max(0, Math.round((it.t1 - it.t0) / 1000));
-    const t = new Date(it.t0).toLocaleTimeString("zh-CN", { hour12: false });
-    const cls = ["tl-row", cur ? "tl-current" : "", markNew && i === 0 ? "tl-new" : ""].join(" ").trim();
-    return `<li class="${cls}" style="--c:${MOOD_COLOR[it.mood] || "#5D6B7A"}">
+  els.timeline.innerHTML = items
+    .map((it, i) => {
+      const cur =
+        i === 0 &&
+        S.phase === "running" &&
+        !S.historyGap &&
+        LAMP.current &&
+        LAMP.current.label === it.label &&
+        !S.stale;
+      const dur = Math.max(0, Math.round((it.t1 - it.t0) / 1000));
+      const t = new Date(it.t0).toLocaleTimeString("zh-CN", { hour12: false });
+      const cls = [
+        "tl-row",
+        cur ? "tl-current" : "",
+        markNew && i === 0 ? "tl-new" : "",
+      ]
+        .join(" ")
+        .trim();
+      return `<li class="${cls}" style="--c:${MOOD_COLOR[it.mood] || "#5D6B7A"}">
       <span class="tl-time">${t}</span>
       <span class="tl-dot" aria-hidden="true"></span>
       <span class="tl-label">${it.zh}<span class="en">${it.label}</span></span>
-      <span class="tl-score">${dur > 0 ? `${dur} 秒` : '刚刚'}${it.scoreType === 'softmax' ? ` / ${(it.score*100).toFixed(0)}%` : ''}</span>
+      <span class="tl-score">${dur > 0 ? `${dur} 秒` : "刚刚"}${it.scoreType === "softmax" ? ` / ${(it.score * 100).toFixed(0)}%` : ""}</span>
     </li>`;
-  }).join("");
+    })
+    .join("");
 }
 
 function updateMeta() {
@@ -630,12 +935,11 @@ function updateMeta() {
       : "";
     return;
   }
-  const elapsed = Math.max(1, Math.min(10, (Date.now()-S.runStartTs)/1000));
+  const elapsed = Math.max(1, Math.min(10, (Date.now() - S.runStartTs) / 1000));
   const rate = (S.accepted.length / elapsed).toFixed(1);
-  const t = S.lastTiming;
   els.stageMeta.textContent =
-    `${FRAME_TEST ? '测试图片' : '采集'} ${S.trackInfo.w}×${S.trackInfo.h}` +
-    (FRAME_TEST ? '' : ` ${Math.round(S.trackInfo.fps)} fps`) +
+    `${FRAME_TEST ? "测试图片" : "采集"} ${S.trackInfo.w}×${S.trackInfo.h}` +
+    (FRAME_TEST ? "" : ` ${Math.round(S.trackInfo.fps)} fps`) +
     ` / 更新 ${rate} 次/秒 / 延迟 ${S.e2eMs} ms`;
 }
 
@@ -650,29 +954,39 @@ function drawOverlay(faces, primary) {
   const fw = v.videoWidth || (S.trackInfo && S.trackInfo.w) || 1280;
   const fh = v.videoHeight || (S.trackInfo && S.trackInfo.h) || 720;
   if (c.width !== fw || c.height !== fh) {
-    c.width = fw; c.height = fh;
+    c.width = fw;
+    c.height = fh;
   }
   const ctx = c.getContext("2d");
   ctx.clearRect(0, 0, c.width, c.height);
   if (!faces.length) return;
-  const multi = faces.length > 1;
   ctx.lineWidth = Math.max(2, c.width / 480);
   for (const f of faces) {
-    const w = f.x2 - f.x1, h = f.y2 - f.y1;
-    const displayX = document.body.dataset.mirror === 'false' ? f.x1 : fw - f.x2;
-    const isPrimary = primary && primary.box &&
-      Math.abs(primary.box[0] - f.x1) < 1 && Math.abs(primary.box[1] - f.y1) < 1;
-    const person=LAMP.snapshot?.group?.people.find(p=>p.id===f.track_id);
-    const emotion=person?.current || f.emotion || (isPrimary?primary:null);
-    ctx.strokeStyle = emotion && !emotion.uncertain ? MOOD_COLOR[emotion.label] : '#C3B6CE';
+    const w = f.x2 - f.x1,
+      h = f.y2 - f.y1;
+    const displayX =
+      document.body.dataset.mirror === "false" ? f.x1 : fw - f.x2;
+    const isPrimary =
+      primary &&
+      primary.box &&
+      Math.abs(primary.box[0] - f.x1) < 1 &&
+      Math.abs(primary.box[1] - f.y1) < 1;
+    const person = LAMP.snapshot?.group?.people.find(
+      (p) => p.id === f.track_id,
+    );
+    const emotion =
+      person?.current || f.emotion || (isPrimary ? primary : null);
+    ctx.strokeStyle =
+      emotion && !emotion.uncertain ? MOOD_COLOR[emotion.label] : "#C3B6CE";
     ctx.strokeRect(displayX, f.y1, w, h);
     if (emotion || person) {
-      const text = `${person?'P'+person.id+' · ':''}${emotion?.uncertain?'观察中':emotion?.label_zh||'确认中'}${person?.status==='holding'?' · 保留':''}`;
+      const text = `${person ? "P" + person.id + " · " : ""}${emotion?.uncertain ? "观察中" : emotion?.label_zh || "确认中"}${person?.status === "holding" ? " · 保留" : ""}`;
       ctx.font = `600 ${Math.max(14, c.width / 46)}px "Noto Sans CJK SC", sans-serif`;
       const tw = ctx.measureText(text).width;
       const pad = Math.max(6, c.width / 160);
       const bh = Math.max(24, c.width / 30);
-      const bx = Math.max(0, Math.min(displayX, fw - tw - pad*2)), by = Math.max(0, f.y1 - bh - 4);
+      const bx = Math.max(0, Math.min(displayX, fw - tw - pad * 2)),
+        by = Math.max(0, f.y1 - bh - 4);
       ctx.fillStyle = "rgba(13,18,24,0.82)";
       ctx.fillRect(bx, by, tw + pad * 2, bh);
       ctx.fillStyle = ctx.strokeStyle;
@@ -684,24 +998,40 @@ function drawOverlay(faces, primary) {
 
 /* ---------------- 事件 ---------------- */
 els.btn.addEventListener("click", () => {
-  if (S.phase === "running" || S.phase === 'starting') stop();
+  if (S.phase === "running" || S.phase === "starting") stop();
   else if (S.phase === "idle") void start();
 });
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) {
-    releaseLight('pause');
-    LAMP.reset(); S.historyGap = true; document.body.dataset.mood = "none"; renderCurrent();
-    if (S.submitTimer) { clearInterval(S.submitTimer); S.submitTimer = null; }
+    releaseLight("pause");
+    LAMP.reset();
+    S.historyGap = true;
+    document.body.dataset.mood = "none";
+    renderCurrent();
+    if (S.submitTimer) {
+      clearInterval(S.submitTimer);
+      S.submitTimer = null;
+    }
   } else if (S.phase === "running" && !S.submitTimer) {
-    const id=S.runId;
-    void lightSession('resume',id).then(light=>{
-      if(S.runId===id&&S.phase==='running'&&!document.hidden){
-        LAMP.apply(light);S.submitTimer=setInterval(submitTick,CFG.submitIntervalMs);
-      }
-    }).catch(err=>{if(S.runId===id){stop();setBanner('warn','light-owner',err.message);}});
+    const id = S.runId;
+    void lightSession("resume", id)
+      .then((light) => {
+        if (S.runId === id && S.phase === "running" && !document.hidden) {
+          LAMP.apply(light);
+          S.submitTimer = setInterval(submitTick, CFG.submitIntervalMs);
+        }
+      })
+      .catch((err) => {
+        if (S.runId === id) {
+          stop();
+          setBanner("warn", "light-owner", err.message);
+        }
+      });
   }
 });
-window.addEventListener("pagehide", () => { if (S.phase === "running" || S.phase === 'starting') stop(); });
+window.addEventListener("pagehide", () => {
+  if (S.phase === "running" || S.phase === "starting") stop();
+});
 
 /* ---------------- 初始 ---------------- */
 document.body.dataset.mood = "none";
@@ -710,4 +1040,185 @@ updateStageStatus();
 renderCurrent();
 renderTimeline(false);
 void refreshSvcBadge();
-setInterval(() => { if (S.phase === "idle") void refreshSvcBadge(); }, 30000);
+setInterval(() => {
+  if (S.phase === "idle") void refreshSvcBadge();
+}, 30000);
+
+function releaseLight(action = "stop") {
+  if (S.runId)
+    void lightSession(action, S.runId, true).catch((error) =>
+      console.warn("释放灯光会话失败，将等待租约过期", error),
+    );
+}
+
+function receiveLight(light) {
+  const previous = LAMP.current?.label;
+  LAMP.apply(light);
+  if (previous && !LAMP.current) S.historyGap = true;
+  renderCurrent();
+}
+
+function lightUnavailable(error) {
+  if (LAMP.snapshot)
+    LAMP.snapshot.device = { status: "unavailable", message: error.message };
+  LAMP.current = null;
+  LAMP.status = "waiting";
+  document.dispatchEvent(new Event("barometer-update"));
+}
+
+function validateInference(result) {
+  if (
+    !Number.isInteger(result.seq) ||
+    result.seq < 0 ||
+    !Number.isInteger(result.count) ||
+    result.count < 0 ||
+    !Array.isArray(result.faces) ||
+    result.faces.length !== result.count ||
+    !result.frame ||
+    ![result.frame.w, result.frame.h].every(
+      (value) => Number.isFinite(value) && value > 0,
+    ) ||
+    !result.faces.every(
+      (face) =>
+        face &&
+        ["x1", "x2", "y1", "y2"].every((key) => Number.isFinite(face[key])) &&
+        validEmotion(face.emotion),
+    ) ||
+    !validEmotion(result.primary) ||
+    (result.count !== 1 && result.primary !== null) ||
+    !result.timing ||
+    !["decode_ms", "detect_ms", "emotion_ms", "total_ms"].every((key) =>
+      Number.isFinite(result.timing[key]),
+    )
+  ) {
+    throw new Error("推理响应数据不完整");
+  }
+  validateLight(result.light);
+}
+
+function applyModelInfo(health) {
+  const model = health.models?.emotion;
+  const valid =
+    health.ok &&
+    model &&
+    model.key === health.emotion_key &&
+    Array.isArray(health.labels) &&
+    health.labels.length > 0 &&
+    health.labels.every(
+      (label) =>
+        /^#[0-9a-f]{6}$/i.test(health.palette?.[label]) &&
+        typeof health.labels_zh?.[label] === "string",
+    ) &&
+    Array.isArray(model.providers) &&
+    typeof model.name === "string" &&
+    Array.isArray(health.model_options) &&
+    health.model_options.length > 0 &&
+    health.model_options.every(
+      (option) =>
+        typeof option.key === "string" && typeof option.name === "string",
+    ) &&
+    health.model_options.some((option) => option.key === health.emotion_key) &&
+    /^#[0-9a-f]{6}$/i.test(health.standby?.color) &&
+    Number.isFinite(health.standby.brightness) &&
+    health.timing &&
+    [
+      "confirm_seconds",
+      "confirm_samples",
+      "change_interval_seconds",
+      "transition_ms",
+      "vote_window_seconds",
+      "vote_samples",
+      "vote_ratio",
+      "expire_grace_seconds",
+      "heartbeat_ms",
+    ].every((key) => Number.isFinite(health.timing[key]));
+  if (!valid) throw new Error("模型信息不完整，请检查服务日志或刷新页面");
+  currentModel = health.emotion_key;
+  activeLabels = health.labels;
+  MOOD_COLOR = health.palette;
+  LABEL_ZH = health.labels_zh;
+  presentation = { standby: health.standby, timing: health.timing };
+  $("modelSelect").replaceChildren(
+    ...health.model_options.map(
+      (option) => new Option(option.name, option.key),
+    ),
+  );
+  $("modelSelect").value = currentModel;
+  $("modelDescription").textContent =
+    `${model.name}，${activeLabels.length} 类。${model.providers.join(" / ")}。${model.score_type === "logit" ? "返回原始分数，不转换为百分比。" : "使用 RGB 与作者规定的归一化。"}`;
+  renderTiming(health.timing);
+  createDistribution();
+  updateWeather();
+  if (!lightSyncStarted) {
+    lightSyncStarted = true;
+    startLightSync(
+      {
+        getRunId: () => (S.phase === "running" ? S.runId : null),
+        onLight: receiveLight,
+        onUnavailable: lightUnavailable,
+        onOwnershipLost: (error) => {
+          stop();
+          setBanner("warn", "light-owner", error.message);
+        },
+      },
+      health.timing.heartbeat_ms,
+    );
+  }
+}
+
+$("mirrorToggle").addEventListener("change", (e) => {
+  document.body.dataset.mirror = String(e.target.checked);
+  if (!S.stale) drawOverlay(S.lastFaces, S.lastPrimary);
+});
+$("clearHistory").addEventListener("click", () => {
+  S.timeline = [];
+  S.historyGap = true;
+  renderTimeline(false);
+  updateWeather();
+});
+
+$("modelSelect").addEventListener("change", async (e) => {
+  if (S.phase !== "idle" || changingModel) {
+    e.target.value = currentModel;
+    return;
+  }
+  const key = e.target.value;
+  changingModel = true;
+  e.target.disabled = true;
+  $("btnMain").disabled = true;
+  $("modelStatus").textContent = "正在加载并检查模型…";
+  try {
+    await lightSessionQueue;
+    const r = await fetch("/api/model", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: key }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.error?.message || "模型切换失败");
+    S.timeline = [];
+    S.historyGap = true;
+    renderTimeline(false);
+    applyModelInfo(j);
+    $("modelStatus").textContent = "模型已就绪，可以开始体验。";
+  } catch (err) {
+    e.target.value = currentModel;
+    $("modelStatus").textContent = `切换失败。${err.message}`;
+  } finally {
+    changingModel = false;
+    e.target.disabled = false;
+    $("btnMain").disabled = false;
+  }
+});
+
+window.addEventListener("DOMContentLoaded", () => {
+  fetch("/api/health")
+    .then((response) => response.json())
+    .then((health) => {
+      if (health.ok) applyModelInfo(health);
+    })
+    .catch((error) => {
+      $("modelDescription").textContent = `模型信息读取失败。${error.message}`;
+    });
+});

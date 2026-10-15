@@ -1,63 +1,176 @@
-/* The browser mirrors backend state; it never decides the physical lamp color. */
-class LightController {
-  constructor() { this.reset(); }
-  reset() { this.current=null;this.status='waiting';this.snapshot=null; }
-  apply(light) {
-    if (!light) return;
-    if (this.snapshot?.instance===light.instance && this.snapshot.sample_ms>light.sample_ms) return;
-    this.snapshot=light;this.current=light.current;this.status=light.status;
+/* 浏览器同步后端灯态；控制权与实体颜色均由 K3 决定。 */
+"use strict";
+
+function validEmotion(emotion) {
+  return (
+    emotion === null ||
+    (!!emotion &&
+      typeof emotion.label === "string" &&
+      typeof emotion.label_zh === "string" &&
+      typeof emotion.uncertain === "boolean")
+  );
+}
+
+function validateLight(light) {
+  const pixels = (rows) =>
+    Array.isArray(rows) &&
+    rows.length > 0 &&
+    rows.every(
+      (pixel) =>
+        Array.isArray(pixel) &&
+        pixel.length === 3 &&
+        pixel.every(
+          (channel) =>
+            Number.isFinite(channel) && channel >= 0 && channel <= 255,
+        ),
+    );
+  const group = light?.group,
+    transition = light?.transition;
+  if (
+    !light ||
+    typeof light.instance !== "string" ||
+    !Number.isFinite(light.sample_ms) ||
+    !validEmotion(light.current) ||
+    !["stable", "holding", "waiting"].includes(light.status) ||
+    !light.device ||
+    typeof light.device.status !== "string" ||
+    !Number.isFinite(light.power) ||
+    !pixels(light.pixels) ||
+    !transition ||
+    !pixels(transition.from_pixels) ||
+    !pixels(transition.to_pixels) ||
+    transition.from_pixels.length !== light.pixels.length ||
+    transition.to_pixels.length !== light.pixels.length ||
+    !pixels([transition.from, transition.to]) ||
+    !["from_power", "to_power", "elapsed_ms", "duration_ms"].every((key) =>
+      Number.isFinite(transition[key]),
+    ) ||
+    !group ||
+    !Array.isArray(group.people) ||
+    !Array.isArray(group.composition) ||
+    typeof group.key !== "string" ||
+    typeof group.agreed !== "boolean" ||
+    !Number.isInteger(group.confirmed_count) ||
+    !Number.isInteger(group.visible_count) ||
+    !group.people.every(
+      (person) =>
+        Number.isInteger(person.id) &&
+        Array.isArray(person.box) &&
+        person.box.length === 4 &&
+        person.box.every(Number.isFinite) &&
+        typeof person.visible === "boolean" &&
+        typeof person.status === "string" &&
+        validEmotion(person.current) &&
+        validEmotion(person.raw),
+    ) ||
+    !group.composition.every(
+      (color) =>
+        typeof color.label === "string" &&
+        typeof color.label_zh === "string" &&
+        Number.isInteger(color.count) &&
+        color.count > 0,
+    )
+  ) {
+    throw new Error("灯光响应数据不完整");
   }
 }
 
-let lightSessionQueue=Promise.resolve();
-function lightSession(action,runId,keepalive=false) {
-  if(!runId)return Promise.resolve(null);
-  const request=async()=>{
-    const r=await fetch('/api/light/session',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({action,run_id:runId}),keepalive,signal:AbortSignal.timeout(3000)});
-    const data=await r.json();
-    if(!data.ok)throw Error(data.error?.message||'灯光会话连接失败');
-    return data.light;
+class LightController {
+  constructor() {
+    this.reset();
+  }
+  reset() {
+    this.current = null;
+    this.status = "waiting";
+    this.snapshot = null;
+  }
+  apply(light) {
+    validateLight(light);
+    // 同一进程内只接受较新的快照；重启后的单调时钟不能与旧进程比较。
+    if (
+      this.snapshot?.instance === light.instance &&
+      this.snapshot.sample_ms > light.sample_ms
+    )
+      return;
+    this.snapshot = light;
+    this.current = light.current;
+    this.status = light.status;
+  }
+}
+
+let lightSessionQueue = Promise.resolve();
+function lightSession(action, runId, keepalive = false) {
+  const request = async () => {
+    const response = await fetch("/api/light/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action, run_id: runId }),
+      keepalive,
+      signal: AbortSignal.timeout(3000),
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) {
+      const error = new Error(payload.error?.message || "灯光会话连接失败");
+      error.code = payload.error?.code;
+      throw error;
+    }
+    validateLight(payload.light);
+    return payload.light;
   };
-  const next=lightSessionQueue.then(request,request);
-  lightSessionQueue=next.catch(()=>null);
-  return next;
+  // 会话命令顺序执行，避免停止与重新开启在网络中乱序。
+  const pending = lightSessionQueue.then(request, request);
+  lightSessionQueue = pending.catch(() => null);
+  return pending;
 }
 
-function releaseLight(action='stop') {
-  const id=S.runId;
-  if(id)void lightSession(action,id,true).catch(()=>{});
-}
-
-async function pollLight() {
-  try {
-    if(!document.hidden){
-      const r=await fetch('/api/light',{cache:'no-store',signal:AbortSignal.timeout(2000)});
-      if(!r.ok)throw Error('灯光服务不可达');
-      const data=await r.json();
-      const previous=LAMP.current?.label;
-      LAMP.apply(data.light);
-      if(previous&&!LAMP.current)S.historyGap=true;
-      renderCurrent();
+function startLightSync(callbacks, heartbeatMs) {
+  const notify = (callback, value) => {
+    // 页面绘制失败只记前端错误，不应改写为 USB 或后端断联；下一轮仍继续。
+    try {
+      callback(value);
+    } catch (error) {
+      console.error("灯光页面更新失败", error);
     }
-  } catch {
-    if(LAMP.snapshot)LAMP.snapshot.device={status:'unavailable',message:'灯光服务不可达'};
-    LAMP.current=null;LAMP.status='waiting';
-    document.dispatchEvent(new Event('barometer-update'));
-  } finally { setTimeout(pollLight,100); }
-}
-
-let lightHeartbeatBusy=false;
-setInterval(async()=>{
-  if(typeof S==='undefined'||S.phase!=='running'||document.hidden||lightHeartbeatBusy)return;
-  const id=S.runId;lightHeartbeatBusy=true;
-  try {
-    const light=await lightSession('start',id);
-    if(S.runId===id)LAMP.apply(light);
-  } catch(err) {
-    if(S.runId===id&&String(err.message).includes('另一页面')){
-      stop();setBanner('warn','light-owner',err.message);
+  };
+  async function poll() {
+    try {
+      if (document.hidden) return;
+      let light;
+      try {
+        const response = await fetch("/api/light", {
+          cache: "no-store",
+          signal: AbortSignal.timeout(2000),
+        });
+        if (!response.ok) throw new Error("灯光服务不可达");
+        const payload = await response.json();
+        validateLight(payload.light);
+        light = payload.light;
+      } catch (error) {
+        notify(callbacks.onUnavailable, error);
+        return;
+      }
+      notify(callbacks.onLight, light);
+    } finally {
+      setTimeout(poll, 100);
     }
-  } finally {lightHeartbeatBusy=false;}
-},2000);
-window.addEventListener('DOMContentLoaded',()=>void pollLight());
+  }
+  async function heartbeat() {
+    try {
+      const runId = callbacks.getRunId();
+      if (!runId || document.hidden) return;
+      let light;
+      try {
+        light = await lightSession("start", runId);
+      } catch (error) {
+        if (callbacks.getRunId() === runId && error.code === "light_busy")
+          notify(callbacks.onOwnershipLost, error);
+        return;
+      }
+      if (callbacks.getRunId() === runId) notify(callbacks.onLight, light);
+    } finally {
+      setTimeout(heartbeat, heartbeatMs);
+    }
+  }
+  void poll();
+  setTimeout(heartbeat, heartbeatMs);
+}
