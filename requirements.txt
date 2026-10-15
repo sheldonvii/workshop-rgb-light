@@ -24,9 +24,7 @@ packaging==25.0
 protobuf==7.36.1
 sympy==1.14.0
 
-# Vision 引擎依赖：
-#   spacemit_vision 必须锁 0.1.2 —— 0.1.3+ 链接 OpenCV 5.0 系统库，
-#   而本机 /opt/opencv-spacemit 只有 4.14（0.1.2 与本机 spacemit-ai-gateway 同版）。
-#   pyyaml 为 spacemit_vision 的依赖，uv 会自动带入，这里显式锁定。
+# Vision 0.1.4 对应 /opt/opencv-spacemit 的 OpenCV 5.0 系统库。
+# pyyaml 为 Vision 依赖，系统库须与锁定版本匹配。
 pyyaml==6.0.3
-spacemit_vision==0.1.2
+spacemit_vision==0.1.4

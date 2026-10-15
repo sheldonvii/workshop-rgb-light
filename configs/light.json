@@ -5,7 +5,11 @@
   "brightness": 0.1,
   "mixed_brightness": 0.6,
   "current_alignment": {
-    "targets_ma": [220, 450, 700],
+    "targets_ma": [
+      220,
+      450,
+      700
+    ],
     "led_ma": 55,
     "controller_bri": 128,
     "reserve_ma": 120,
@@ -15,7 +19,6 @@
     0.35,
     0.6
   ],
-  "group_mode": "spatial",
   "standby_brightness": 0.06,
   "standby_color": "#EAB7CF",
   "transition_ms": 400,
