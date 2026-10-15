@@ -6,9 +6,18 @@
 
 运行平台为 SpacemiT K3、Bianbu 4.0.3 riscv64，Python 3.14.4。Python 依赖和下游安装索引固定在 `requirements.txt`。模型 URL、版本和 SHA-256 统一维护在 `server/emotion_models.py`。
 
-`spacemit_vision` 锁定 0.1.4，对应 `/opt/opencv-spacemit` 的 OpenCV 5.0 系统库；Python wheel `opencv-python==5.0.0.93` 与引擎链接的系统库是两套依赖，都须匹配。服务先导入 `cv2` 再导入 Vision。
+`spacemit_vision` 锁定 0.1.4。OpenCV 分两层安装：
 
-Python 3.14 对应的 OpenCV wheel 必须包含 `cv2/config-3.14.py`。安装只使用 SpacemiT 下游索引，避免混源解析成需要编译的源码包。首次重建需要网络，`.venv` 与 `.uv-cache` 不随仓库分发。
+| 依赖 | 安装方式 | 核对 |
+| --- | --- | --- |
+| SpacemiT OpenCV 系统库 | `sudo apt install opencv-spacemit=5.0.0-1bb1`，安装到 `/opt/opencv-spacemit` | `dpkg-query -W opencv-spacemit` 应显示 5.0.0-1bb1 |
+| Python cv2 包 | `uv pip install -r requirements.txt`，锁定 `opencv-python==5.0.0.93` | 在项目虚拟环境执行 `import cv2`，版本为 5.0.0 |
+
+两者都需要，安装 `requirements.txt` 不会替代系统库安装。不要用通用 OpenCV 4.x 库或将旧库改名来满足 Vision 0.1.4 的依赖。服务先导入 `cv2` 再导入 Vision；完整命令与导入检查见 [安装与运行](../README.md#安装与运行)。
+
+上述系统包来自 Bianbu 4 的 SpacemiT 软件源；当前板端候选版本为 5.0.0-1bb1。`apt-cache policy opencv-spacemit` 可检查来源和可用版本；若只看到 4.14，先核对系统版本及 Bianbu 4 软件源，不在此项目中自动切换系统源。
+
+Python 3.14 对应的 OpenCV wheel 必须包含 `cv2/config-3.14.py`。安装只使用 SpacemiT 下游索引，避免混源解析成需要编译的源码包。首次重建需要网络。先用 uv 创建 `.venv`，再安装依赖；缓存位置可沿用 uv 默认值。项目内 `.uv-cache` 仅是可选缓存，不是启动前提，也不随仓库分发。
 
 项目可以放在其他目录。`run.sh` 和服务入口会将工作目录设为项目根目录，YAML 中的模型、标签和测试图均为相对路径。浏览器测试从自身位置推导根目录。浏览器需要中文字体，如系统 `Noto Sans CJK SC`。
 

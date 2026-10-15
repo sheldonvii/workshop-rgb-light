@@ -1,5 +1,4 @@
 # Python 3.14.4 (系统解释器 /usr/bin/python3.14, riscv64) — 重建命令:
-#   export UV_CACHE_DIR=$PWD/.uv-cache
 #   ~/.local/bin/uv venv .venv --python /usr/bin/python3.14
 #   ~/.local/bin/uv pip install --python .venv/bin/python \
 #     --index-url https://git.spacemit.com/api/v4/projects/33/packages/pypi/simple \
