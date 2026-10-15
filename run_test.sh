@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the demo checks from any working directory.
+# 从任意工作目录运行统一检查。
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 python_bin="${TEST_PYTHON:-$PWD/.venv/bin/python}"
