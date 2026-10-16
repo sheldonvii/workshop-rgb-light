@@ -1,124 +1,95 @@
-# 情绪晴雨表
+# 情绪晴雨表 (Emotion Barometer)
 
-在 SpacemiT K3 上用 USB 摄像头识别人脸表情，让网页灯带、背景和控件同步变色。画面在本机处理。通过 USB Adalight 二进制协议控制 WLED 实体灯带，网页同步显示后端灯光状态；控制器不需要连接 Wi-Fi。
+[![Platform](https://img.shields.io/badge/Platform-SpacemiT%20K3-0052CC?logo=linux&logoColor=white)](https://spacemit.com)
+[![OS](https://img.shields.io/badge/OS-Bianbu%204.0.3%20(riscv64)-E95420?logo=ubuntu&logoColor=white)](https://archive.spacemit.com)
+[![Python](https://img.shields.io/badge/Python-3.14.4-3776AB?logo=python&logoColor=white)](https://www.python.org)
+[![Hardware](https://img.shields.io/badge/Hardware-WLED%200.15.1%20%7C%2060%20LEDs-16A34A)](docs/controller.md)
 
-默认使用 HSEmotion B0 八分类，设置中可以切换 B2 或官方七分类模型。多人入镜时逐人确认表情，一致时共同增亮，不同时按画面左右分区渐变。网页保留弯曲灯线，用沿线渐变和背景呈现颜色占比。识别结果描述可见表情，不代表真实心理状态。
+情绪晴雨表是运行在 SpacemiT K3 上的软硬件联动演示项目。连接普通 USB 摄像头与 WLED 灯带后，K3 会在本地实时分析人脸表情，让网页界面与桌面实体灯带随着镜头前大家的情绪变化同步变色。
 
-## 硬件初始化
+### 它能做什么
 
-使用 USB 摄像头、WLED-Controller-S2（WLED 0.15.1）和 1 米 60 颗 RGB 灯珠。摄像头与控制器通过支持数据传输的 USB 接口或扩展坞连接 K3，灯带接控制器。首次启动 Demo 前完成下面两项。
+* **本地实时识别人脸情绪**：人脸检测（YOLOv5-Face）与情绪分类（HSEmotion / 官方模型）均在 K3 本地运行，不依赖云端。支持在网页设置中实时热切换模型，直观对比不同模型的识别表现。
+* **物理灯带与网页同步联动**：通过 USB 串口以 Adalight 协议控制 60 颗 WLED 实体 RGB 灯带，前端页面实时同步灯光渲染与过渡轨迹，把边缘视觉推理转化为直观的环境光交互。
+* **多人同框与空间分区渐变**：多人入镜时，算法按画面中的左右方位自动为灯带分配空间区间；当大家表情一致时，灯光还会协同提升亮度。
 
-### 1. 配置串口权限
+---
 
-在 K3 终端执行，其他账户需将 `bianbu` 替换为实际用户名：
+## 快速上手
 
-```bash
-ls -l /dev/serial/by-id/
-sudo usermod -aG dialout bianbu
-```
+### 1. 软件环境与模型
 
-退出并重新登录，执行 `id` 确认包含 `dialout`。日常运行无需 sudo；核对 [configs/light.json](configs/light.json) 的 `port` 与实际设备路径一致。
-
-### 2. 将控制器灯珠数量初始化为 60
-
-控制器出厂可能只配置了 30 颗，此时 60 颗灯带可能只有前半段亮起。先检查控制器内的数量设置，再排查灯带；项目中的 `led_count=60` 不会自动改写控制器。
-
-首次使用按 [60 颗控制器准备步骤](docs/prepare-wled.md#首次操作) 安装独立维护环境，再执行其中的 `--check` 查询。已是 60 颗则无需写入；仍为 30 颗时，按同一文档进入 USB 下载模式，执行 `--prepare`，将总数量和单路长度都改为 60。全过程通过 USB 完成，无需连接控制器 Wi-Fi。
-
-准备后保持控制器正常启动、Demo 服务停止，用维护环境再次检查：
+运行环境为 Bianbu 4.0.3 riscv64，要求 Python 3.14.4 与 uv。
 
 ```bash
-.venv-controller/bin/python scripts/prepare_wled_60.py --check \
-  --port /dev/serial/by-id/usb-WEMOS.CC_LOLIN-S2-MINI_0-if00
-```
-
-端口替换为实际路径。返回 `PASS` 表示控制器已配置 60 颗、850mA；启动 Demo 后再观察整条灯带是否亮起。接线、灯带类型、GPIO、颜色顺序和排障见 [控制器说明](docs/controller.md)。仅体验网页时，可将 `enabled` 设为 `false`，跳过控制器初始化。
-
-## 安装与运行
-
-以下命令在 K3 的项目根目录执行，适用于已安装 Python 3.14.4 和 uv 的 Bianbu 4.0.3 riscv64。板端 uv 默认位于 `~/.local/bin/uv`；若安装在其他位置，替换下面的命令路径。
-
-### 1. 创建虚拟环境
-
-```bash
+# 创建虚拟环境
 ~/.local/bin/uv venv .venv --python /usr/bin/python3.14
 source .venv/bin/activate
-```
 
-uv 使用默认缓存即可，无需先设置缓存目录。
-
-### 2. 安装 OpenCV 系统库
-
-Vision 0.1.4 需要 SpacemiT 的 OpenCV 5.0 系统库。首次部署在 K3 执行：
-
-```bash
+# 安装 SpacemiT OpenCV 5.0 系统库（安装至 /opt/opencv-spacemit）
 sudo apt update
 sudo apt install opencv-spacemit=5.0.0-1bb1
-dpkg-query -W opencv-spacemit
-```
 
-最后一条应显示 `5.0.0-1bb1`。此系统包安装到 `/opt/opencv-spacemit`；不能用 Ubuntu 通用 OpenCV 4.x 包代替。若软件源找不到该版本，先核对 Bianbu 4 软件源，详见 [环境说明](docs/development.md#环境与路径)。
-
-### 3. 安装 Python 依赖并检查 OpenCV 与 Vision
-
-```bash
+# 安装 Python 依赖并校验 Vision 扩展
 ~/.local/bin/uv pip install --python .venv/bin/python \
   --index-url https://git.spacemit.com/api/v4/projects/33/packages/pypi/simple \
   -r requirements.txt
-.venv/bin/python - <<'PY'
-import cv2
-from spacemit_vision import extension_available, extension_import_error
 
-print("OpenCV:", cv2.__version__)
-if not extension_available():
-    raise RuntimeError(extension_import_error())
-print("Vision 扩展可用")
-PY
+# 下载并校验模型权重
+.venv/bin/python scripts/download_models.py
 ```
 
-`requirements.txt` 安装 `opencv-python==5.0.0.93` 和 `spacemit_vision==0.1.4` 等依赖。Python 的 `cv2` 包与上一步的 OpenCV 系统库都需要安装；检查应输出 `OpenCV: 5.0.0` 和 `Vision 扩展可用`。
+### 2. 硬件连接与配置
 
-### 4. 下载模型并启动
+将 USB 摄像头与 WLED-Controller-S2（固件 WLED 0.15.1，接 60 颗 RGB 灯带）接入 K3 的 USB 端口。
 
-确认已完成上方硬件初始化，再执行：
+首次连接时配置串口访问权限：
 
 ```bash
-.venv/bin/python scripts/download_models.py
+sudo usermod -aG dialout bianbu
+```
+
+重新登录会话使组权限生效，执行 `id` 确认包含 `dialout`。核对 [configs/light.json](configs/light.json) 中的串口路径与实际设备一致。
+
+控制器出厂默认若配置为 30 颗，可通过 [prepare-wled.md](docs/prepare-wled.md) 一次性将配置更新为 60 颗。日常无需重复配置。
+
+### 3. 运行 Demo
+
+```bash
 ./run.sh
 ```
 
-在 K3 浏览器打开 `http://127.0.0.1:8321/`，点击开始体验。设置里的模型切换需先停止体验。页面的停止按钮释放摄像头；终端 `Ctrl-C` 停止服务。已有环境和已初始化的控制器，日常直接执行 `./run.sh`。
+在 K3 浏览器中打开 `http://127.0.0.1:8321/`，点击开始体验。
+* 摄像头开启实时检测与表情分类。
+* 网页与实体灯带同步显示情绪色彩与过渡动画。
+* 页面停止按钮释放摄像头并使灯带恢复待机光；终端按 Ctrl-C 退出服务。
 
-权重不进入 Git。[server/emotion_models.py](server/emotion_models.py) 维护四个在用模型的来源和 SHA-256；下载脚本共用该信息，已有文件校验不符时会报错，不覆盖。
+## 自动化检查
 
-## 一键检查
-
-在其他网页停止体验后执行，测试会切换模型并短暂改变灯色；需要 Node.js 22+、系统 Chromium、摄像头和已连接的控制器。
+执行统一检查脚本，验证灯光规则、模型接口、页面交互及硬件通信：
 
 ```bash
 ./run_test.sh
 ```
 
-检查覆盖灯光规则、模型文件、接口、页面交互、真实摄像头和 USB 控制器。没有服务时临时启动并在结束后停止；已有服务则保留，并恢复原模型。失败时终端会指出环节、日志路径和排查建议。
+运行报告与日志生成在 `tests/output/latest/` 目录。离线检查代码逻辑可执行 `./run_test.sh --unit`；无硬件接入时可执行 `./run_test.sh --no-hardware`。
 
-最近一次的汇总为 `tests/output/latest/summary.txt`，机器可读报告为 `report.json`，详细日志与截图在同目录。每次运行覆盖上一轮输出，返回码非零表示失败。仅检查代码用 `./run_test.sh --unit`，无摄像头和控制器时用 `./run_test.sh --no-hardware`；被跳过的项目不会算作通过。长时间验证与灯珠寻址说明见 [开发验证](docs/development.md#测试与复现)。
-
-## 目录
+## 目录结构
 
 | 路径 | 用途 |
 | --- | --- |
-| `server/`、`configs/` | HTTP 服务、推理和模型配置 |
-| `web/` | 页面、后端灯光状态显示和共用测试帧 |
-| `scripts/` | 模型下载校验、控制器首次准备 |
-| `run_test.sh`、`tests/` | 统一检查入口、测试与最近一次报告 |
-| `docs/controller.md` | 控制器接线、权限、参数与排障 |
-| `docs/development.md` | 当前行为、API、环境约束与开发验证 |
-| `licenses/` | 第三方许可和来源 |
+| `server/`、`configs/` | 后端服务、推理链路与模型配置 |
+| `web/` | 前端界面、灯效渲染与测试帧 |
+| `scripts/` | 模型下载校验与控制器配置脚本 |
+| `run_test.sh`、`tests/` | 自动化测试入口、用例与报告 |
+| `docs/controller.md` | 控制器接线、串口通信与电流分档说明 |
+| `docs/development.md` | 数据流、API 接口、时序规则与开发指南 |
+| `licenses/` | 第三方许可与引用来源 |
 
-## 页面
+## 界面示例
 
-下图使用明确标注的测试图片经 B0 真实推理，非现场摄像头采集。
+下图为使用测试图片经 B0 模型推理的实际界面效果：
 
 ![桌面情绪灯光](docs/images/desktop.png)
 
-[移动端设置示例](docs/images/mobile-settings.png)。第三方来源见 [许可说明](licenses/README.md)。
+移动端界面参考 [移动端设置示例](docs/images/mobile-settings.png)。第三方版权信息见 [许可说明](licenses/README.md)。
