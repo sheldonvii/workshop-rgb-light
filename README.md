@@ -3,7 +3,7 @@
 [![Platform](https://img.shields.io/badge/Platform-SpacemiT%20K3-0052CC?logo=linux&logoColor=white)](https://spacemit.com)
 [![OS](https://img.shields.io/badge/OS-Bianbu%204.0.3%20(riscv64)-E95420?logo=ubuntu&logoColor=white)](https://archive.spacemit.com)
 [![Python](https://img.shields.io/badge/Python-3.14.4-3776AB?logo=python&logoColor=white)](https://www.python.org)
-[![Hardware](https://img.shields.io/badge/Hardware-WLED%200.15.1%20%7C%2060%20LEDs-16A34A)](docs/controller.md)
+[![Arch](https://img.shields.io/badge/Arch-RISC--V%2064--bit-16A34A?logo=riscv&logoColor=white)](https://riscv.org)
 
 情绪晴雨表是运行在 SpacemiT K3 上的软硬件联动演示项目。连接普通 USB 摄像头与 WLED 灯带后，K3 会在本地实时分析人脸表情，让网页界面与桌面实体灯带随着镜头前大家的情绪变化同步变色。
 
